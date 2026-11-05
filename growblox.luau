@@ -16,11 +16,12 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.10-config", live = true, running = false, busy = false,
+    version = "0.11-privacy", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil, uiRequests = {},
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
         verifyEvery = 20, alternative = "punch-burst"},
+    privacy = {hideName = true, hideWorld = true, alias = "Blizzard Hub", revision = 0, active = false},
     utilities = {ultraFPS = false, leaveStaff = false, leaveCount = false, maxPeople = 3, present = {}, hooks = {}, fpsSaved = {}, fpsConnections = {}, leaving = false},
     farm = {running = false, config = {loot = false}}, -- cancelled; no Auto Farm worker/UI
     dirt = {running = false, phase = "Preview before starting", placed = 0, floors = 0,
@@ -63,6 +64,7 @@ local S = {
             clientOnly = "A local 2-to-0 tile change is not success; rejected requests returned to 2"},
     },
 }
+local displayPrivacyText = function(text) return tostring(text or "") end
 local API = {State = S}
 E.GrowbloxHub = API
 local executorIdentity = type(getthreadidentity) == "function" and getthreadidentity() or 8
@@ -147,7 +149,7 @@ end
 local function key(layer, x, y) return layer .. ":" .. x .. ":" .. y end
 local function status(message)
     S.status = message
-    if S.label then pcall(function() S.label:SetText((tostring(message):match("^[^\r\n]+") or "Idle"):sub(1, 110)) end) end
+    if S.label then pcall(function() S.label:SetText(displayPrivacyText((tostring(message):match("^[^\r\n]+") or "Idle"):sub(1, 110))) end) end
 end
 
 -- ByteNet listen has no disposer; remove precisely our listener on Unload.
@@ -2356,6 +2358,7 @@ function API.SetUltraFPS(enabled)
     end
 end
 function API.CleanupUtilities()
+    if API.CleanupPrivacy then API.CleanupPrivacy() end
     API.SetUltraFPS(false)
     for _, hook in S.utilities.hooks do
         local listeners = hook.packet.getListeners()
@@ -2378,12 +2381,154 @@ task.spawn(function()
         end
         if S.utilityLabel then
             local u = API.UtilityStatus()
-            pcall(function() S.utilityLabel:SetText(string.format("World: %s | People: %s\n%s", tostring(world.name or "-"),
+            pcall(function() S.utilityLabel:SetText(string.format("World: %s | People: %s\n%s", displayPrivacyText(world.name or "-"),
                 tostring(u.people or "?"), u.lastError or u.lastLeave or "Ready")) end)
         end
         task.wait(0.5)
     end
 end)
+
+-- Render-only aliases. Account attributes, renderer.text and world.name remain
+-- original; only BitmapText layout output and ordinary display labels are masked.
+local function privacyMask(text,tokens,alias)
+    text=tostring(text or "")
+    local lower,out,i=text:lower(),{},1
+    local function word(c) return c~="" and c:match("[%w_]")~=nil end
+    while i<=#text do
+        if text:sub(i,i+#alias-1)==alias then out[#out+1]=alias;i+=#alias
+        elseif text:sub(i,i)=="<" and text:find(">",i,true) then
+            local j=text:find(">",i,true);out[#out+1]=text:sub(i,j);i=j+1
+        else
+            local match
+            for _,token in tokens do
+                local n=#token
+                if n>0 and lower:sub(i,i+n-1)==token:lower() then
+                    local left,right=text:sub(i-1,i-1),text:sub(i+n,i+n)
+                    local style=i>=3 and text:sub(i-2,i-2)=="`"
+                    if (not word(left) or style) and not word(right) then match=token;break end
+                end
+            end
+            if match then out[#out+1]=alias;i+=#match else out[#out+1]=text:sub(i,i);i+=1 end
+        end
+    end
+    return table.concat(out)
+end
+local function refreshPrivacyTokens()
+    local u=S.privacy
+    local player=game.Players.LocalPlayer
+    local name,display,gameName=player.Name,player.DisplayName,player:GetAttribute("GameName")
+    local signature=table.concat({tostring(name),tostring(display),tostring(gameName),tostring(world.name),tostring(u.hideName),tostring(u.hideWorld)},"\0")
+    if signature~=u.signature then
+        local tokens,seen={},{}
+        local function add(s)
+            if type(s)=="string" and s~="" and not seen[s:lower()] then tokens[#tokens+1]=s;seen[s:lower()]=true end
+        end
+        if u.hideName then add(name);add(display);add(gameName) end
+        if u.hideWorld then add(world.name) end
+        table.sort(tokens,function(a,b) return #a>#b end)
+        u.tokens,u.signature,u.revision=tokens,signature,u.revision+1
+    end
+end
+function API.PrivacyStatus()
+    local u=S.privacy
+    local total,masked=0,0
+    for _,entry in u.bitmaps or {} do total+=1;if entry.masked then masked+=1 end end
+    return {hideName=u.hideName,hideWorldName=u.hideWorld,alias=u.alias,active=u.active,
+        trackedBitmaps=total,maskedBitmaps=masked,error=u.error}
+end
+function API.SetHideName(enabled)
+    S.privacy.hideName=enabled==true
+    refreshPrivacyTokens()
+end
+function API.SetHideWorldName(enabled)
+    S.privacy.hideWorld=enabled==true
+    refreshPrivacyTokens()
+end
+function API.CleanupPrivacy()
+    local u=S.privacy
+    u.active=false;u.epoch=(u.epoch or 0)+1
+    if u.bitmap and u.bitmap._layout==u.wrapper then u.bitmap._layout=u.originalLayout end
+    for object in u.bitmaps or {} do
+        pcall(function()
+            if object.frame and object.frame.Parent then
+                local raw=object.text;object.text=nil;u.bitmap.set(object,raw)
+            end
+        end)
+    end
+    for label,entry in u.labels or {} do
+        pcall(function() if label.Parent and label.Text==entry.shown then label.Text=entry.raw end end)
+    end
+    for _,c in u.connections or {} do c:Disconnect() end
+    if E.BlizzardPrivacyDisplay and E.BlizzardPrivacyDisplay.owner==u then E.BlizzardPrivacyDisplay=nil end
+end
+function API.InstallPrivacy()
+    if E.BlizzardPrivacyDisplay and E.BlizzardPrivacyDisplay.cleanup then E.BlizzardPrivacyDisplay.cleanup() end
+    local u=S.privacy
+    u.bitmaps=setmetatable({},{__mode="k"});u.labels=setmetatable({},{__mode="k"});u.connections={}
+    u.bitmap=require(RS.Shared.BitmapText);u.originalLayout=u.bitmap._layout
+    refreshPrivacyTokens()
+    displayPrivacyText=function(text) return privacyMask(text,u.tokens or {},u.alias) end
+    local function trackBitmap(object)
+        if type(object)=="table" and typeof(object.frame)=="Instance" and object.frame:IsDescendantOf(game.Players.LocalPlayer.PlayerGui) then
+            if not u.bitmaps[object] then u.bitmaps[object]={revision=-1,at=0} end
+        end
+    end
+    u.wrapper=function(object,text)
+        refreshPrivacyTokens()
+        trackBitmap(object)
+        local masked=displayPrivacyText(text)
+        local entry=u.bitmaps[object]
+        if entry then entry.masked=masked~=tostring(text or "");entry.revision=u.revision;entry.at=os.clock() end
+        return u.originalLayout(object,masked)
+    end
+    u.bitmap._layout=u.wrapper
+    for _,object in filtergc("table",{Keys={"frame","glyphs","text","backGlyphs"}},false) do trackBitmap(object) end
+    local function trackLabel(label)
+        if label:IsA("TextLabel") and not u.labels[label] then u.labels[label]={raw=label.Text,shown=label.Text,revision=-1} end
+    end
+    local gui=game.Players.LocalPlayer.PlayerGui
+    for _,label in gui:QueryDescendants("TextLabel") do trackLabel(label) end
+    u.connections[#u.connections+1]=gui.DescendantAdded:Connect(trackLabel)
+    u.active=true;u.epoch=(u.epoch or 0)+1
+    local epoch=u.epoch
+    E.BlizzardPrivacyDisplay={owner=u,cleanup=API.CleanupPrivacy}
+    task.spawn(function()
+        while S.live and u.active and u.epoch==epoch do
+            refreshPrivacyTokens()
+            for object,entry in u.bitmaps do
+                if not object.frame or not object.frame.Parent then u.bitmaps[object]=nil
+                elseif entry.revision~=u.revision or entry.raw~=object.text or (entry.masked and os.clock()-entry.at>0.75) then
+                    local raw=object.text
+                    local ok,err=pcall(function()
+                        object.text=nil -- invalidate same-text shortcut; layout wrapper preserves raw identity
+                        u.bitmap.set(object,raw)
+                    end)
+                    if ok then entry.raw=raw;entry.revision=u.revision;entry.at=os.clock() else object.text=raw;u.error=tostring(err) end
+                end
+            end
+            for label,entry in u.labels do
+                if not label.Parent then u.labels[label]=nil
+                else
+                    local current=label.Text
+                    if current~=entry.shown then entry.raw=current end
+                    if entry.revision~=u.revision or current~=entry.shown then
+                        local masked=displayPrivacyText(entry.raw)
+                        pcall(function() label.Text=masked end)
+                        entry.shown,entry.revision=masked,u.revision
+                    end
+                end
+            end
+            if S.label and (u.lastStatus~=S.status or u.lastStatusRevision~=u.revision) then
+                local text=(tostring(S.status or "Idle"):match("^[^\r\n]+") or "Idle"):sub(1,110)
+                pcall(function() S.label:SetText(displayPrivacyText(text)) end)
+                u.lastStatus,u.lastStatusRevision=S.status,u.revision
+            end
+            task.wait(0.15)
+        end
+    end)
+end
+local privacyOK,privacyError=pcall(API.InstallPrivacy)
+if not privacyOK then S.privacy.error=tostring(privacyError) end
 
 -- Use Alexandria's own SaveManager, matching the Hush integration.
 -- Runtime worker switches and per-world checkpoints are not configuration.
@@ -2391,7 +2536,7 @@ local function setupConfigManager(manager, library, settingsTab)
     local folder = "BeverlyHub/Growblox/" .. string.format("%.0f", game.PlaceId)
     manager:SetLibrary(library)
     manager:IgnoreThemeSettings() -- keep the existing Halloween purple/magenta theme
-    manager:SetIgnoreIndexes({"GBAutoClearWorld", "GBSpecialDirtFarm", "GBDirtBuilder", "GBAutoFarm"})
+    manager:SetIgnoreIndexes({"GBAutoClearWorld", "GBSpecialDirtFarm", "GBDirtBuilder", "GBAutoFarm", "GBHideName", "GBHideWorldName"})
     manager:SetFolder(folder)
     -- Native CRUD remains intact; constrain filenames to this config directory.
     local function validName(name)
@@ -2454,7 +2599,7 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.10 | Config profiles",
+        Footer = "v0.11 | Privacy aliases",
         Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
@@ -2532,6 +2677,10 @@ local function buildUI()
     local dirtStats = group(dirtTab, "Right", "Tracking", "activity")
     S.dirtLabel = dirtStats:AddLabel("Preview before starting", true)
     local util = group(utilities, "Left", "Utilites", "zap")
+    util:AddToggle("GBHideName", {Text = "Hide Name", Default = true,
+        Callback = function(value) API.SetHideName(value) end})
+    util:AddToggle("GBHideWorldName", {Text = "Hide World Name", Default = true,
+        Callback = function(value) API.SetHideWorldName(value) end})
     util:AddToggle("GBUltraFPS", {Text = "Ultra FPS booster", Default = false,
         Callback = function(value) API.SetUltraFPS(value) end})
     util:AddToggle("GBLeaveStaff", {Text = "Auto leave on Mods/Admin", Default = false,
