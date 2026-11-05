@@ -921,33 +921,60 @@ collectNearby = function(force)
         if i > 16 or not S.live then break end
         local def = DB[d.id]
         local isGem = def and def.kind == "gem"
-        local room = isGem and 65535 or math.max(0, 200 - (S.loot.counts[d.id] or 0))
-        if not isGem and not S.loot.counts[d.id] and S.loot.used >= S.loot.capacity then room = 0 end
-        local want = math.min(d.n or 1, room)
-        if want <= 0 then
-            S.loot.fullItems[d.id] = true
-            S.loot.retryAt[d.uid] = os.clock() + 15
+        if isGem then
+            -- Anti-magnet fix for autoclear: gems require native physical avatar touch, not remote takeDrop packet
+            local curX, curY = position()
+            local dx = d.x - curX
+            if math.abs(dx) > 0.35 and math.abs(d.y - curY) < 1.8 then
+                local key = dx > 0 and Enum.KeyCode.D or Enum.KeyCode.A
+                inputKey(key, true)
+                local began = os.clock()
+                repeat
+                    task.wait(0.02)
+                    curX = position()
+                until math.abs(curX - d.x) <= 0.35 or os.clock() - began > 0.35
+                releaseMovement()
+            end
+            task.wait(0.04)
+            S.loot.gems += (d.n or 1)
+            claimed += (d.n or 1)
+            gotGems = true
+            local list = world.dropList()
+            local index = table.find(list, d)
+            if index then
+                if d.frame then pcall(function() d.frame:Destroy() end) end
+                table.remove(list, index)
+            end
         else
-            local beforeN = d.n or 1
-            S.loot.attempts += 1
-            local got = world.takeDrop(d.uid, want)
-            restoreExecutorContext()
-            assert(type(got) == "number", "Unexpected native takeDrop reply")
-            if got > 0 then
-                local bucket = isGem and "gems" or (def and def.kind == "seed" and "seeds" or "blocks")
-                S.loot[bucket] += got; claimed += got; gotGems = gotGems or isGem
-                if not isGem then S.loot.counts[d.id] = (S.loot.counts[d.id] or 0) + got end
+            -- Normal inventory item (seed or block): takeDrop packet still works
+            local room = math.max(0, 200 - (S.loot.counts[d.id] or 0))
+            if not S.loot.counts[d.id] and S.loot.used >= S.loot.capacity then room = 0 end
+            local want = math.min(d.n or 1, room)
+            if want <= 0 then
+                S.loot.fullItems[d.id] = true
+                S.loot.retryAt[d.uid] = os.clock() + 15
+            else
+                local beforeN = d.n or 1
+                S.loot.attempts += 1
+                local got = world.takeDrop(d.uid, want)
+                restoreExecutorContext()
+                assert(type(got) == "number", "Unexpected native takeDrop reply")
+                if got > 0 then
+                    local bucket = def and def.kind == "seed" and "seeds" or "blocks"
+                    S.loot[bucket] += got; claimed += got
+                    S.loot.counts[d.id] = (S.loot.counts[d.id] or 0) + got
 
-                if got >= beforeN then
-                    local list = world.dropList()
-                    local index = table.find(list, d)
-                    if index then
-                        if d.frame then pcall(function() d.frame:Destroy() end) end
-                        table.remove(list, index)
-                    end
-                elseif d.n == beforeN then d.n = beforeN - got end
-                S.loot.retryAt[d.uid] = os.clock() + 1
-            else S.loot.denied += 1; S.loot.retryAt[d.uid] = os.clock() + 1 end
+                    if got >= beforeN then
+                        local list = world.dropList()
+                        local index = table.find(list, d)
+                        if index then
+                            if d.frame then pcall(function() d.frame:Destroy() end) end
+                            table.remove(list, index)
+                        end
+                    elseif d.n == beforeN then d.n = beforeN - got end
+                    S.loot.retryAt[d.uid] = os.clock() + 1
+                else S.loot.denied += 1; S.loot.retryAt[d.uid] = os.clock() + 1 end
+            end
         end
     end
     if claimed > 0 then refreshLootInventory() end
