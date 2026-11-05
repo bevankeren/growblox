@@ -16,15 +16,18 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.9-dirt-builder", live = true, running = false, busy = false,
+    version = "0.9.2-clear-row-lock", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
-    sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil,
+    sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil, uiRequests = {},
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
         verifyEvery = 20, alternative = "punch-burst"},
     utilities = {ultraFPS = false, leaveStaff = false, leaveCount = false, maxPeople = 3, present = {}, hooks = {}, fpsSaved = {}, fpsConnections = {}, leaving = false},
     farm = {running = false, config = {loot = false}}, -- cancelled; no Auto Farm worker/UI
     dirt = {running = false, phase = "Preview before starting", placed = 0, floors = 0,
         checkpointFile = "growblox-dirt-builder-checkpoint.json", config = {topY = 3, interval = 0.25, rowLimit = 0}},
+    specialDirt = {running = false, phase = "Preview before starting", placedPlatforms = 0, placedDirt = 0, mined = 0, floors = 0,
+        checkpointFile = "growblox-special-dirt-checkpoint.json", config = {interval = 0.24, placeInterval = 0.25, floorLimit = 0},
+        cursor = nil, stats = {mined = 0, placedPlatforms = 0, placedDirt = 0, floors = 0}, plan = nil, stock = {}},
     mining = {effectiveInterval = 0.24, timeouts = 0, backoffs = 0},
     progress = nil, blocked = {}, engine = "spatial-corridor-v2",
     loot = previousLoot and previousLoot.job == game.JobId and previousLoot or {
@@ -184,11 +187,26 @@ task.spawn(function()
         pcall(function() virtualInput:SendKeyEvent(false, key, false, game) end)
     end
 end)
-local function syncClearToggle(value)
-    if not S.clearToggle then return end
-    S.changingClearToggle = true
-    pcall(function() S.clearToggle:SetValue(value) end)
-    S.changingClearToggle = false
+local function requestToggle(key,value)
+    S.uiRequests[key] = value == true
+end
+local function syncClearToggle(value) requestToggle("clear",value) end
+-- Called only by the UI-owned updater, never by an RPC-resumed worker.
+local function flushToggleRequests()
+    for key,value in S.uiRequests do
+        local field,flag
+        if key=="clear" then field,flag="clearToggle","changingClearToggle"
+        elseif key=="dirt" then field,flag="dirtToggle","changingDirtToggle"
+        elseif key=="specialDirt" then field,flag="specialDirtToggle","changingSpecialDirtToggle" end
+        local control=field and S[field]
+        if control then
+            S[flag]=true
+            local ok,err=pcall(function() control:SetValue(value) end)
+            S[flag]=false
+            if ok and S.uiRequests[key]==value then S.uiRequests[key]=nil
+            elseif not ok then S.lastUIUpdateError=tostring(err) end
+        end
+    end
 end
 function API.Stop(reason)
     S.farm.running = false
@@ -196,10 +214,15 @@ function API.Stop(reason)
         S.dirt.phase="Paused: "..(type(reason)=="string" and reason or "manual stop")
     end
     S.dirt.running = false
+    if S.specialDirt.running and not (type(reason)=="string" and reason:sub(1,13)=="Special Dirt:") then
+        S.specialDirt.phase = "Paused: " .. (type(reason)=="string" and reason or "manual stop")
+    end
+    S.specialDirt.running = false
     if API.SaveDirtCheckpoint then API.SaveDirtCheckpoint() end
-    if S.dirtToggle then S.changingDirtToggle = true; pcall(function() S.dirtToggle:SetValue(false) end); S.changingDirtToggle = false end
+    if API.SaveSpecialDirtCheckpoint then API.SaveSpecialDirtCheckpoint() end
+    requestToggle("dirt",false)
+    requestToggle("specialDirt",false)
     if S.actionRestore then pcall(S.actionRestore); S.actionRestore = nil end
-    if S.farmToggle then S.changingFarmToggle = true; pcall(function() S.farmToggle:SetValue(false) end); S.changingFarmToggle = false end
     S.cancelAutoStart = true
     S.lastStopReason = type(reason) == "string" and reason or "manual pause"
     S.lastStopAt = os.clock()
@@ -273,13 +296,44 @@ local function passable(id)
     local d = DB[id or 0]
     return id == 0 or (d ~= nil and not d.solid and not d.hurts and (d.kind ~= "seed" or (S.farm and S.farm.running)))
 end
+-- Bedrock identity is unchanged. Classification is geometric: only a connected
+-- component reaching y=h-1 is basal; the isolated spawn pedestal is not a floor.
+local function bedrockComponent(x,y)
+    if tile(0,x,y)~=8 then return nil end
+    local nodes,seen,head={{x=x,y=y}},{[y*world.w+x]=true},1
+    local result={minX=x,maxX=x,minY=y,maxY=y,size=0,touchesBottom=false}
+    while head<=#nodes do
+        local n=nodes[head];head+=1;result.size+=1
+        result.minX=math.min(result.minX,n.x);result.maxX=math.max(result.maxX,n.x)
+        result.minY=math.min(result.minY,n.y);result.maxY=math.max(result.maxY,n.y)
+        if n.y==world.h-1 then result.touchesBottom=true end
+        for _,d in {{-1,0},{1,0},{0,-1},{0,1}} do
+            local nx,ny=n.x+d[1],n.y+d[2]
+            local key=ny*world.w+nx
+            if nx>=0 and nx<world.w and ny>=0 and ny<world.h and not seen[key] and tile(0,nx,ny)==8 then
+                seen[key]=true;nodes[#nodes+1]={x=nx,y=ny}
+            end
+        end
+    end
+    result.kind=result.touchesBottom and "basal" or "local-obstacle"
+    return result
+end
+API.BedrockInfo=bedrockComponent
 local function canStand(x, y)
     if not (x >= 0 and x < world.w and y >= 1 and y < world.h and passable(tile(0, x, y))) then return false end
     -- Native farming demo and the Main Door spawn both stand in a one-cell
     -- clear corridor below a solid ceiling. Do not impose a two-cell body on
     -- this mode; the real game still performs all collisions via normal input.
     if (S.farm and S.farm.running) or (S.dirt and S.dirt.running) then return true end
-    return passable(tile(0, x, y - 1))
+    if passable(tile(0, x, y - 1)) then return true end
+    local u=S.clearUnderpassBounds
+    if u and y==u.y and x>=u.x0 and x<=u.x1 then
+        local roof=tile(0,x,y-1)
+        local def=DB[roof or 0]
+        -- One-cell native corridors, scoped to the small spawn detour only.
+        return def~=nil and not def.hurts and (roof==8 or S.natural[roof]==true)
+    end
+    return false
 end
 local function canMineFrom(px, py, x, y)
     local dx, dy = x + 0.5 - px, y + 0.5 - py
@@ -347,7 +401,7 @@ function API.LoadCheckpoint()
     assert(type(readfile) == "function" and type(isfile) == "function" and isfile("growblox-clear-checkpoint.json"), "No saved checkpoint")
     local p = game:GetService("HttpService"):JSONDecode(readfile("growblox-clear-checkpoint.json"))
     assert(type(p) == "table" and p.world == world.name and p.job == game.JobId and boundsValid(p.bounds), "Checkpoint does not match this world/server")
-    assert(p.movementMode == "native-input" and p.engine == S.engine, "Old-engine checkpoint refused; preview again")
+    assert(p.movementMode == "native-input" and p.engine == S.engine and p.routeVersion == 3 and p.mode == "world-clear", "Old row cursor refused; preview live remaining tiles again")
     assert(type(p.row) == "number" and type(p.nextX) == "number" and (p.direction == 1 or p.direction == -1), "Invalid checkpoint cursor")
     S.progress, p.state = p, "Paused"
     status("Checkpoint loaded - Start / Resume to continue")
@@ -829,6 +883,76 @@ local function mineLayer(x, y, layer, generation, run)
     if t.afterSettled ~= 0 then return false, "Tile was corrected after normal mining" end
     return true
 end
+local function openSpawnUnderpass(tx,ty,generation,run)
+    local px,py=position()
+    local p=S.progress
+    local obstacle
+    for y=math.max(0,ty-2),math.min(world.h-1,ty+1) do
+        for x=math.max(p.bounds.x0,math.min(math.floor(px),tx)-1),math.min(p.bounds.x1,math.max(math.floor(px),tx)+1) do
+            if math.abs(x-tx)<=4 and tile(0,x,y)==8 then
+                local c=bedrockComponent(x,y)
+                if not c.touchesBottom and c.size<=12 and c.maxY+1<=p.bounds.y1 then obstacle=c;break end
+            end
+        end
+        if obstacle then break end
+    end
+    if not obstacle then return false,"No local bedrock pedestal near target" end
+    local tunnelY=obstacle.maxY+1
+    local u={x0=math.max(p.bounds.x0,obstacle.minX-2),x1=math.min(p.bounds.x1,obstacle.maxX+2),y=tunnelY,row=ty}
+    S.clearUnderpassBounds,p.underpass=u,u
+    p.phase="spawn-underpass (same row)"
+    p.detours=(p.detours or 0)+1
+    local savedRow,savedX=p.row,p.nextX
+    for _=1,8 do
+        if not active(generation) then return false,"Paused" end
+        local ax,ay=position()
+        if canMineFrom(ax,ay,tx,ty) then return true end
+        local route=pathTo(tx,ty,false)
+        if route then
+            local moved=follow(route,generation)
+            if moved then return true end
+        end
+        local best,score
+        for x=u.x0,u.x1 do
+            local id=tile(0,x,tunnelY)
+            local below=DB[tile(0,x,tunnelY+1) or 0]
+            local ownSupport=math.floor(ax)==x and math.floor(ay-0.02)+1==tunnelY
+            if eligible(0,x,tunnelY) and DB[id] and not DB[id].hurts and not ownSupport
+                and below and not below.hurts and (below.solid or below.platform)
+                and canMineFrom(ax,ay,x,tunnelY) then
+                local cost=math.abs(x-tx)+math.abs(x+0.5-ax)*0.1
+                if not score or cost<score then best,score=x,cost end
+            end
+        end
+        if not best then return false,"No safe local access cell; row retained" end
+        local first=#run.targets+1
+        local ok,err=mineLayer(best,tunnelY,0,generation,run)
+        if not ok then return false,err end
+        if S.config.background and eligible(1,best,tunnelY) then
+            ok,err=mineLayer(best,tunnelY,1,generation,run)
+            if not ok then return false,err end
+        end
+        for i=first,#run.targets do run.targets[i].detourForRow=ty end
+        p.localDetourCells=(p.localDetourCells or 0)+1
+        assert(p.row==savedRow and p.nextX==savedX,"Detour changed the requested row cursor")
+        local path,why=pathTo(best,tunnelY,true)
+        if not path then return false,why end
+        local moved,failure=follow(path,generation)
+        if not moved then return false,failure end
+    end
+    return false,"Local detour budget reached; row retained"
+end
+local function rowPending(y,bounds)
+    local targets={}
+    for x=bounds.x0,bounds.x1 do
+        if eligible(0,x,y) or eligible(1,x,y) then targets[#targets+1]=x end
+    end
+    return targets
+end
+function API.ClearRowStatus(y)
+    local b=S.progress and S.progress.bounds or {x0=0,x1=world.w-1}
+    return {row=y,pending=rowPending(y,b)}
+end
 local function clearCell(x, y, generation, run, stay)
     local fg = tile(0, x, y)
     if fg ~= 0 and not eligible(0, x, y) then
@@ -837,13 +961,17 @@ local function clearCell(x, y, generation, run, stay)
     end
     if fg == 0 and (not S.config.background or not eligible(1, x, y)) then return true end
     local reached, why = navigate(x, y, generation, stay)
+    local usedUnderpass=false
     if not reached then
         if string.find(why or "", "No stand point", 1, true) then
-            S.progress.unreachable = (S.progress.unreachable or 0) + 1
-            S.progress.lastUnreachable = {x = x, y = y, reason = why}
-            return true -- continue other reachable cells; final server count prevents false completion
+            local opened,detourError=openSpawnUnderpass(x,y,generation,run)
+            if opened then usedUnderpass=true;reached,why=navigate(x,y,generation,stay)
+            else why=detourError or why end
         end
-        return false, why
+        if not reached then
+            S.progress.lastUnreachable={x=x,y=y,reason=why}
+            return false,"Row blocked at "..x..","..y..": "..tostring(why)
+        end
     end
     for layer = 0, (S.config.background and 1 or 0) do
         local ok, err = mineLayer(x, y, layer, generation, run)
@@ -863,7 +991,7 @@ local function clearCell(x, y, generation, run, stay)
             local path, err = pathTo(x, y, true)
             if path then moved, why = follow(path, generation) else why = err end
         end
-        if not moved then return false, why end
+        if not moved and not (usedUnderpass and grounded()) then return false, why end
     end
     collectNearby(false)
     S.progress.cells += 1
@@ -1133,9 +1261,9 @@ function API.Start(region)
         "Start locked: validate normal walk/jump after reconnect; old flying movement is disabled")
     S.config.background = true -- requested snake flow always clears the cave layer too
     local p = S.progress
-    if region or not p or p.movementMode ~= "native-input" or p.engine ~= S.engine or p.world ~= world.name or p.job ~= game.JobId or not p.bounds or p.complete then
+    if region or not p or p.routeVersion ~= 3 or p.mode ~= "world-clear" or p.movementMode ~= "native-input" or p.engine ~= S.engine or p.world ~= world.name or p.job ~= game.JobId or not p.bounds or p.complete then
         local plan = API.Preview(region)
-        p = {world = world.name, job = game.JobId, movementMode = "native-input", engine = S.engine, bounds = table.clone(plan.bounds),
+        p = {world = world.name, job = game.JobId, mode = "world-clear", routeVersion = 3, movementMode = "native-input", engine = S.engine, bounds = table.clone(plan.bounds),
             row = plan.bounds.y0, nextX = plan.bounds.x0, direction = 1, edgePending = false, rowEntered = false, startedAt = os.clock(),
             moves = 0, distance = 0, detours = 0, hits = 0, cells = 0, foreground = 0, background = 0,
             protected = 0, unreachable = 0, serverCleared = 0, serverRejected = 0, verifications = 0, turns = 0,
@@ -1143,7 +1271,9 @@ function API.Start(region)
         S.progress = p
     elseif p.row > p.bounds.y1 then
         p.row, p.nextX, p.direction, p.edgePending = p.bounds.y0, p.bounds.x0, 1, false
+        p.rowEntered=false;p.rowRescans=0
     end
+    S.clearUnderpassBounds=p.underpass
     local px, py = position()
     assert(grounded(), "Avatar must start on solid ground")
     S.blocked, S.boundWorld = {}, world.name
@@ -1199,12 +1329,25 @@ function API.Start(region)
                     if p.serverRejected > rejectedAtStart then error("Server rejected a removal; paused rather than retry flooding") end
                 end
                 if edge then
+                    local pending=rowPending(p.row,p.bounds)
+                    if #pending>0 then
+                        p.rowRescans=(p.rowRescans or 0)+1
+                        assert(p.rowRescans<=2,"Current row still has targets; refusing to descend")
+                        local px=position()
+                        local left,right=pending[1],pending[#pending]
+                        p.direction=math.abs(px-left-0.5)<=math.abs(px-right-0.5) and 1 or -1
+                        p.nextX=p.direction==1 and left or right
+                        p.rowEntered=true;p.edgePending=false
+                        p.phase="recheck same row"
+                    else
+                    p.rowRescans=0;p.underpass=nil;S.clearUnderpassBounds=nil
                     p.row += 1; p.direction = -p.direction; p.rowEntered = false
                     p.nextX = p.direction == 1 and p.bounds.x0 or p.bounds.x1
                     p.edgePending = true
                     if p.row <= p.bounds.y1 then
                         p.turns += 1
                         if #p.turnLog < 30 then p.turnLog[#p.turnLog + 1] = {row = p.row, direction = p.direction, edgeX = p.nextX} end
+                    end
                     end
                     checkpoint()
                 end
@@ -1606,7 +1749,7 @@ function API.StartDirtFarm()
     S.boundWorld=world.name;S.generation=(S.generation or 0)+1
     local generation=S.generation
     d.running,S.running,S.busy,d.error=true,true,true,nil
-    S.changingDirtToggle=true;if S.dirtToggle then S.dirtToggle:SetValue(true) end;S.changingDirtToggle=false
+    requestToggle("dirt",true)
     S.worker=task.spawn(function()
         task.wait()
         local ok,err=xpcall(function()
@@ -1666,6 +1809,379 @@ function API.StartDirtFarm()
     return plan
 end
 
+
+
+-- ==============================================================================
+-- SPECIAL DIRT FARM: TUNNEL DOWNWARDS & BUILD PLATFORMS (LOWER HALF AUTO BUILDER)
+-- ==============================================================================
+local function planSpecialDirtLayout(fg, bg, db, width, height)
+    local leftShaft, rightShaft = 0, width - 1
+    local leftPlatform, rightPlatform = 1, width - 2
+    local leftDirt, rightDirt = 2, width - 3
+
+    -- 1. Find base floor from upperside
+    local baseFloor = nil
+    for y = height - 2, 1, -1 do
+        if fg[y] and fg[y][leftPlatform] == 102 and fg[y][rightPlatform] == 102 then
+            baseFloor = y
+            break
+        end
+    end
+    baseFloor = baseFloor or 35 -- fallback to row 35
+
+    -- 2. Find bedrock boundary
+    local bedrockTop = height
+    for y = baseFloor + 1, height - 1 do
+        local count = 0
+        for x = 0, width - 1 do
+            if fg[y] and fg[y][x] == 8 then count += 1 end
+        end
+        if count >= width * 0.8 then
+            bedrockTop = y
+            break
+        end
+    end
+
+    local floors = {}
+    local corridors = {}
+    local platformsNeeded = 0
+    local dirtNeeded = 0
+    local tilesToClearFG = 0
+    local tilesToClearBG = 0
+
+    local isDoorArea = function(x, y)
+        return (y == 36 and x >= 77 and x <= 79) or (y == 37 and x == 78)
+    end
+
+    for floorY = baseFloor + 2, bedrockTop - 1, 2 do
+        table.insert(floors, floorY)
+        local corridorY = floorY - 1
+        table.insert(corridors, corridorY)
+
+        -- Shaft gaps at x=0 and x=width-1
+        for _, x in ipairs({leftShaft, rightShaft}) do
+            for _, y in ipairs({corridorY, floorY}) do
+                if not isDoorArea(x, y) then
+                    if (fg[y] and fg[y][x] or 0) ~= 0 then tilesToClearFG += 1 end
+                    if (bg[y] and bg[y][x] or 0) == 14 then tilesToClearBG += 1 end
+                end
+            end
+        end
+
+        -- Corridor clearance at x=1..width-2
+        for x = leftPlatform, rightPlatform do
+            local y = corridorY
+            if not isDoorArea(x, y) then
+                if (fg[y] and fg[y][x] or 0) ~= 0 then tilesToClearFG += 1 end
+                if (bg[y] and bg[y][x] or 0) == 14 then tilesToClearBG += 1 end
+            end
+        end
+
+        -- Floor platforms at x=1 and x=width-2
+        for _, x in ipairs({leftPlatform, rightPlatform}) do
+            local current = fg[floorY] and fg[floorY][x] or 0
+            if current ~= 102 then
+                platformsNeeded += 1
+                if current ~= 0 then tilesToClearFG += 1 end
+                if (bg[floorY] and bg[floorY][x] or 0) == 14 then tilesToClearBG += 1 end
+            end
+        end
+
+        -- Floor dirt line at x=2..width-3
+        for x = leftDirt, rightDirt do
+            if not isDoorArea(x, floorY) then
+                local current = fg[floorY] and fg[floorY][x] or 0
+                if current == 0 then
+                    dirtNeeded += 1
+                elseif current ~= 2 and current ~= 8 and current ~= 9640 then
+                    tilesToClearFG += 1
+                    dirtNeeded += 1
+                end
+            end
+        end
+    end
+
+    return {
+        baseFloor = baseFloor,
+        bedrockTop = bedrockTop,
+        floors = floors,
+        corridors = corridors,
+        platformsNeeded = platformsNeeded,
+        dirtNeeded = dirtNeeded,
+        tilesToClearFG = tilesToClearFG,
+        tilesToClearBG = tilesToClearBG,
+        leftShaft = leftShaft, rightShaft = rightShaft,
+        leftPlatform = leftPlatform, rightPlatform = rightPlatform,
+        leftDirt = leftDirt, rightDirt = rightDirt
+    }
+end
+
+function API.SpecialDirtFarmPreview()
+    assert(not S.running and not S.busy, "Pause automation before preview")
+    local p = planSpecialDirtLayout(world.fg, world.bg, DB, world.w, world.h)
+    S.specialDirt.plan = p
+    S.specialDirt.stock = refreshLootInventory()
+    S.specialDirt.phase = string.format("%d floors (%d..%d) | %d Plat + %d Dirt needed",
+        #p.floors, p.floors[1] or 0, p.floors[#p.floors] or 0, p.platformsNeeded, p.dirtNeeded)
+    return p
+end
+
+function API.SaveSpecialDirtCheckpoint()
+    local sd = S.specialDirt
+    if not sd.cursor or type(writefile) ~= "function" then return end
+    local record = {
+        version = 1,
+        world = world.name,
+        job = game.JobId,
+        cursor = sd.cursor,
+        stats = sd.stats,
+        phase = sd.phase
+    }
+    pcall(writefile, sd.checkpointFile, game:GetService("HttpService"):JSONEncode(record))
+end
+
+function API.LoadSpecialDirtCheckpoint()
+    assert(not S.running and not S.busy, "Pause first")
+    local sd = S.specialDirt
+    assert(type(readfile) == "function" and type(isfile) == "function" and isfile(sd.checkpointFile), "No Special Dirt checkpoint")
+    local p = game:GetService("HttpService"):JSONDecode(readfile(sd.checkpointFile))
+    assert(p.version == 1 and p.world == world.name and p.job == game.JobId, "Checkpoint is from another world/server")
+    sd.cursor = p.cursor
+    sd.stats = p.stats or sd.stats
+    sd.phase = "Checkpoint loaded; toggle ON to resume"
+    return sd.cursor
+end
+
+function API.StartSpecialDirtFarm()
+    assert(not S.running and not S.busy, "Pause other automation first")
+    assert(not (S.recorder and S.recorder.active), "Stop recording first")
+    assert(nativeSetTile, "Native placement helper unavailable")
+
+    local sd = S.specialDirt
+    local plan = API.SpecialDirtFarmPreview()
+    if #plan.floors == 0 then
+        sd.phase = "All lower floors already complete!"
+        return plan
+    end
+
+    S.boundWorld = world.name
+    S.generation = (S.generation or 0) + 1
+    local generation = S.generation
+    sd.running, S.running, S.busy = true, true, true
+    requestToggle("specialDirt", true)
+
+    local function specialMineCell(x, y, gen)
+        if not active(gen) then return false end
+        if y < 36 then return true end
+        if (y == 36 and x >= 77 and x <= 79) or (y == 37 and x == 78) then return true end
+
+        local px, py = position()
+        local distSq = (x + 0.5 - px)^2 + (y + 0.5 - py)^2
+        local maxRange = math.min(controls.punchRange() - 0.1, 2.2)
+        if distSq > (maxRange + 0.3)^2 then
+            return false, "Target out of reach"
+        end
+
+        local fgId = tile(0, x, y)
+        if fgId and fgId ~= 0 and fgId ~= 8 and fgId ~= 6 and fgId ~= 224 and fgId ~= 9640 then
+            local hitsNeeded = (DB[fgId] and DB[fgId].hits and DB[fgId].hits > 0) and DB[fgId].hits or 3
+            for _ = 1, hitsNeeded * 3 + 4 do
+                if not active(gen) then return false end
+                if tile(0, x, y) == 0 then break end
+                hit(x, y)
+                S.nativeCalls += 1
+                sd.stats.mined += 1
+                task.wait(math.max(0.24, S.config.interval))
+            end
+        end
+
+        if tile(0, x, y) == 0 and tile(1, x, y) == 14 then
+            for _ = 1, 10 do
+                if not active(gen) then return false end
+                if tile(1, x, y) == 0 then break end
+                hit(x, y)
+                S.nativeCalls += 1
+                sd.stats.mined += 1
+                task.wait(math.max(0.24, S.config.interval))
+            end
+        end
+        return true
+    end
+
+    local function specialPlaceTile(x, y, wantedId, gen)
+        if not active(gen) then return false end
+        if tile(0, x, y) == wantedId then return true end
+        if (y == 36 and x >= 77 and x <= 79) or (y == 37 and x == 78) then return true end
+
+        local stock = refreshLootInventory()
+        while active(gen) and (stock[wantedId] or 0) <= 0 do
+            sd.phase = string.format("Waiting for %s (need 1+)", DB[wantedId] and DB[wantedId].name or tostring(wantedId))
+            releaseMovement()
+            task.wait(1)
+            stock = refreshLootInventory()
+        end
+        if not active(gen) then return false end
+
+        if tile(0, x, y) ~= 0 and tile(0, x, y) ~= wantedId then
+            specialMineCell(x, y, gen)
+        end
+        if tile(0, x, y) ~= 0 then return false end
+
+        nativeSetTile("fg", x, y, wantedId)
+        task.wait(math.max(0.25, sd.config.placeInterval))
+        if tile(0, x, y) == wantedId then
+            if wantedId == 102 then sd.stats.placedPlatforms += 1
+            elseif wantedId == 2 then sd.stats.placedDirt += 1 end
+            return true
+        end
+        return false
+    end
+
+    local function walkToX(targetX, gen)
+        local px = position()
+        local dir = targetX > px and 1 or -1
+        local keycode = dir == 1 and Enum.KeyCode.D or Enum.KeyCode.A
+        inputKey(keycode, true)
+        local began = os.clock()
+        repeat
+            if not active(gen) then releaseMovement(); return false end
+            task.wait(0.04)
+            px = position()
+        until math.abs(px - targetX) <= 0.35 or os.clock() - began > 1.2
+        releaseMovement()
+        return math.abs(px - targetX) <= 0.4
+    end
+
+    S.worker = task.spawn(function()
+        task.wait()
+        local ok, err = xpcall(function()
+            local curX, curY = position()
+            local currentFloorIndex = 1
+            for i, fY in ipairs(plan.floors) do
+                if math.abs(curY - (fY - 0.001)) <= 1.2 or math.abs(curY - (fY + 0.999)) <= 0.5 then
+                    currentFloorIndex = i
+                    break
+                end
+            end
+
+            local function ensureAvatarOnFloor(targetFloorY, gen)
+                local px, py = position()
+                -- When standing normally on top of targetFloorY, py is approximately targetFloorY - 0.001 (e.g. 40.999 for floor 41).
+                -- Only trigger jump if avatar physically slipped below the platform (py >= targetFloorY + 0.4).
+                if py > (targetFloorY + 0.4) then
+                    inputKey(Enum.KeyCode.Space, true)
+                    task.wait(0.12)
+                    inputKey(Enum.KeyCode.Space, false)
+                    task.wait(0.2)
+                    waitGrounded(2, gen)
+                end
+            end
+
+            for fIdx = currentFloorIndex, #plan.floors do
+                local floorY = plan.floors[fIdx]
+                local corridorY = floorY - 1
+
+                -- Safety check: ensure avatar is standing on top of floorY, not below it!
+                ensureAvatarOnFloor(floorY, generation)
+
+                local px, py = position()
+                local stepDir = (px < (world.w / 2)) and 1 or -1
+                local startX = (stepDir == 1) and 1 or (world.w - 2)
+                local endX = (stepDir == 1) and (world.w - 2) or 1
+
+                local startShaft = (stepDir == 1) and 0 or (world.w - 1)
+                specialMineCell(startShaft, corridorY, generation)
+                specialMineCell(startShaft, floorY, generation)
+
+                local startPlatform = (stepDir == 1) and plan.leftPlatform or plan.rightPlatform
+                if tile(0, startPlatform, floorY) ~= 102 then
+                    specialPlaceTile(startPlatform, floorY, 102, generation)
+                end
+
+                sd.phase = string.format("Floor %d (y=%d) | Tunneling %s", fIdx, floorY, stepDir == 1 and ">" or "<")
+
+                local currentX = math.floor(px)
+                if stepDir == 1 and currentX < 1 then currentX = 1 end
+                if stepDir == -1 and currentX > (world.w - 2) then currentX = world.w - 2 end
+
+                while active(generation) and ((stepDir == 1 and currentX <= endX) or (stepDir == -1 and currentX >= endX)) do
+                    local frontX = currentX + stepDir
+                    if (stepDir == 1 and frontX <= endX) or (stepDir == -1 and frontX >= endX) then
+                        specialMineCell(frontX, corridorY, generation)
+                    end
+
+                    walkToX(currentX + 0.5, generation)
+                    specialMineCell(currentX, corridorY, generation)
+
+                    if currentX == plan.leftPlatform or currentX == plan.rightPlatform then
+                        if tile(0, currentX, floorY) ~= 102 then
+                            specialPlaceTile(currentX, floorY, 102, generation)
+                        end
+                    else
+                        -- NEVER mine the floor under avatar's feet! Keep existing Dirt/Rock as solid floor.
+                        -- Only patch missing air gaps with Dirt.
+                        local curFloorTile = tile(0, currentX, floorY)
+                        if curFloorTile == 0 then
+                            specialPlaceTile(currentX, floorY, 2, generation)
+                        end
+                    end
+
+                    collectNearby(false)
+                    currentX += stepDir
+                    API.SaveSpecialDirtCheckpoint()
+                end
+
+                if not active(generation) then return end
+
+                local endShaft = (stepDir == 1) and (world.w - 1) or 0
+                specialMineCell(endShaft, corridorY, generation)
+                specialMineCell(endShaft, floorY, generation)
+
+                local endPlatform = (stepDir == 1) and plan.rightPlatform or plan.leftPlatform
+                if tile(0, endPlatform, floorY) ~= 102 then
+                    specialPlaceTile(endPlatform, floorY, 102, generation)
+                end
+
+                sd.stats.floors += 1
+
+                if fIdx < #plan.floors then
+                    local nextFloorY = plan.floors[fIdx + 1]
+                    local nextCorridorY = nextFloorY - 1
+
+                    -- Pre-clear corridor below end platform
+                    specialMineCell(endPlatform, nextCorridorY, generation)
+                    specialMineCell(endShaft, nextCorridorY, generation)
+
+                    -- Pre-place the platform on the next floor so avatar lands on a platform, not an abyss!
+                    if tile(0, endPlatform, nextFloorY) ~= 102 then
+                        specialPlaceTile(endPlatform, nextFloorY, 102, generation)
+                    end
+
+                    -- Step into the edge to descend
+                    walkToX(endPlatform + 0.5, generation)
+                    task.wait(0.3)
+                    waitGrounded(2, generation)
+
+                    -- Immediately verify avatar landed on top of nextFloorY; jump if clipped below!
+                    ensureAvatarOnFloor(nextFloorY, generation)
+                end
+            end
+            sd.phase = "Special Dirt Farm Complete: all lower floors finished!"
+            API.SaveSpecialDirtCheckpoint()
+        end, debug.traceback)
+
+        releaseMovement()
+        sd.running = false
+        requestToggle("specialDirt", false)
+        if not ok then
+            sd.phase = tostring(err):match("^[^\r\n]+") or tostring(err)
+            API.Stop("Special Dirt: " .. sd.phase)
+        else
+            API.Stop("Special Dirt: complete")
+        end
+    end)
+    return plan
+end
 
 -- Utilities are presentation-only or use the game's ordinary LeaveWorld call.
 -- No game scripts, grids, input controls or pickup records are destroyed.
@@ -1884,7 +2400,7 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.9 | Dirt builder",
+        Footer = "v0.9.2 | Row-locked clear",
         Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
@@ -1924,6 +2440,21 @@ local function buildUI()
                 if not ok then S.lastStopReason = tostring(err):match("^[^\r\n]+") or tostring(err); status("Start failed: " .. S.lastStopReason); syncClearToggle(false) end
             end)
         end})
+    S.specialDirtToggle = box:AddToggle("GBSpecialDirtFarm", {Text = "Special Dirt Farm (Tunnel & Platform)", Default = false,
+        Callback = function(enabled)
+            if S.changingSpecialDirtToggle then return end
+            if not enabled then if S.specialDirt.running then API.Stop("Special Dirt Farm toggle OFF") end; return end
+            task.spawn(function()
+                local ok, err = pcall(API.StartSpecialDirtFarm)
+                if not ok then
+                    if S.specialDirt.running then API.Stop("Special dirt start failed") end
+                    S.specialDirt.phase = tostring(err)
+                    requestToggle("specialDirt", false)
+                end
+            end)
+        end})
+    button(box, "Preview Special Dirt Layout", function() API.SpecialDirtFarmPreview() end)
+    button(box, "Load Special Checkpoint", API.LoadSpecialDirtCheckpoint)
     local stats = group(clear, "Right", "Tracking", "activity")
     S.label = stats:AddLabel("Idle", true)
     S.trackingLabel = stats:AddLabel("FG 0 | BG 0\nCells 0 | Moves 0\nTime 00:00 | Rate 0/min", true)
@@ -1936,8 +2467,9 @@ local function buildUI()
             task.spawn(function()
                 local ok, err = pcall(API.StartDirtFarm)
                 if not ok then
+                    if S.dirt.running then API.Stop("Dirt start failed") end
                     S.dirt.phase = tostring(err)
-                    S.changingDirtToggle = true; S.dirtToggle:SetValue(false); S.changingDirtToggle = false
+                    requestToggle("dirt",false)
                 end
             end)
         end})
@@ -1978,12 +2510,20 @@ local function buildUI()
     button(session, "Unload", API.Unload)
     task.spawn(function()
         while S.live do
+            flushToggleRequests()
             if S.dirtLabel then pcall(function()
                 local d, p = S.dirt, S.dirt.plan
                 S.dirtLabel:SetText(string.format("%s\nRow %s | x %s\nPlaced %d | Floors %d\nRemaining: Dirt %s | Platform %s\nStock: Dirt %s | Platform %s", d.phase,
                     d.cursor and tostring(d.cursor.row) or "-", d.cursor and tostring(d.cursor.x) or "-", d.placed, d.floors,
                     p and tostring(p.dirtNeeded) or "?", p and tostring(p.platformsNeeded) or "?",
                     d.stock and tostring(d.stock[2] or 0) or "?", d.stock and tostring(d.stock[102] or 0) or "?"))
+            end) end
+            if S.specialDirt and S.label then pcall(function()
+                if S.specialDirt.running then
+                    local sd = S.specialDirt
+                    S.label:SetText(string.format("[Special Dirt Farm] %s\nMined %d | Plat %d | Dirt %d | Floors %d",
+                        sd.phase, sd.stats.mined, sd.stats.placedPlatforms, sd.stats.placedDirt, sd.stats.floors))
+                end
             end) end
             local p = S.progress
             local elapsed = p and math.max(0, (p.finishedAt or os.clock()) - (p.startedAt or os.clock())) or 0
