@@ -102,7 +102,7 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.13-interface", live = true, running = false, busy = false,
+    version = "1.0", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil, uiRequests = {},
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
@@ -3523,7 +3523,7 @@ local function buildUI()
     local logo = API.ResolveBrandLogo()
     local discord = "https://discord.gg/C56zw6khS8"
     local window = library:CreateWindow({Title = "Blizzard Hub Freemium", Icon = logo,
-        Footer = "v0.13  |  discord.gg/C56zw6khS8",
+        Footer = "script 1.0  |  discord.gg/C56zw6khS8",
         Badge = "UNDETECTED", Size = UDim2.fromOffset(720, 480), Center = true, AutoShow = true,
         CornerRadius = 8, ToggleButtonIcon = logo,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
@@ -3597,9 +3597,9 @@ local function buildUI()
     end
     S.discordButton = button(community, "Copy Discord Link", API.CopyDiscordLink)
     local log = group(home, "Right", "Update Log", "history")
-    log:AddLabel("v0.13 - Interface\nHome, English labels and new status panels.\n\nv0.12 - Auto Farm\nBatch farming, storage and harvest modes.", true)
+    log:AddLabel("v1.0 script release", true)
     local notes = group(home, "Left", "Update Notes", "notebook-text")
-    notes:AddLabel("Automation starts OFF.\nTurn a feature OFF, then ON to retry.\nSolid items are checked before farming.", true)
+    notes:AddLabel("Release", true)
     local box = group(clear, "Left", "Auto Clear", "pickaxe")
     S.clearToggle = box:AddToggle("GBAutoClearWorld", {Text = "Auto Clear World", Default = false,
         Callback = function(enabled)
