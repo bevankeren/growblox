@@ -16,7 +16,7 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.9.3-edge-contact", live = true, running = false, busy = false,
+    version = "0.10-config", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil, uiRequests = {},
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
@@ -2385,6 +2385,37 @@ task.spawn(function()
     end
 end)
 
+-- Use Alexandria's own SaveManager, matching the Hush integration.
+-- Runtime worker switches and per-world checkpoints are not configuration.
+local function setupConfigManager(manager, library, settingsTab)
+    local folder = "BeverlyHub/Growblox/" .. string.format("%.0f", game.PlaceId)
+    manager:SetLibrary(library)
+    manager:IgnoreThemeSettings() -- keep the existing Halloween purple/magenta theme
+    manager:SetIgnoreIndexes({"GBAutoClearWorld", "GBSpecialDirtFarm", "GBDirtBuilder", "GBAutoFarm"})
+    manager:SetFolder(folder)
+    -- Native CRUD remains intact; constrain filenames to this config directory.
+    local function validName(name)
+        if type(name) ~= "string" then return false end
+        if #name < 1 or #name > 64 or not name:match("^[%w _%.%-]+$") then return false end
+        if name:match("^%s*$") or name:find("..", 1, true) or name:match("[%. ]$") then return false end
+        return name:lower() ~= "autoload" and not name:lower():match("^autoload_%d+$")
+    end
+    for _, method in {"Save", "Load", "Delete", "SaveAutoloadConfig"} do
+        local original = manager[method]
+        manager[method] = function(self, name, ...)
+            if not validName(name) then
+                return false, "Use a config name with 1-64 letters/numbers, spaces, _ or -; no paths"
+            end
+            return original(self, name, ...)
+        end
+    end
+    manager:BuildConfigSection(settingsTab)
+    S.saveManager = manager
+    S.configSystem = {ready = true, folder = folder .. "/settings", provider = "Alexandria SaveManager"}
+    manager:LoadAutoloadConfig()
+    return manager
+end
+
 -- Same Alexandria initialization, tab/groupbox styling and button compatibility as Hush.
 local function buildUI()
     local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/Alexandria/main/Library.lua"))()
@@ -2423,7 +2454,7 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.9.3 | Edge-contact fix",
+        Footer = "v0.10 | Config profiles",
         Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
@@ -2512,25 +2543,22 @@ local function buildUI()
     local utilStatus = group(utilities, "Right", "Status", "activity")
     utilStatus:AddLabel("Ultra FPS hides the world. Script and pickups stay active.", true)
     S.utilityLabel = utilStatus:AddLabel("Ready", true)
-    local settings = group(cfg, "Left", "Clear", "settings")
-    settings:AddSlider("GBHitInterval", {Text = "Hit interval", Min = 0.24, Max = 1, Default = 0.24, Rounding = 2,
-        Callback = function(v) S.config.interval = v end})
-    settings:AddToggle("GBAutoPickup", {Text = "Pickup drops", Default = true,
-        Callback = function(v) S.config.autoPickup = v end})
-    settings:AddToggle("GBPauseFocus", {Text = "Pause on focus loss", Default = false,
-        Callback = function(v) S.config.pauseOnFocusLoss = v end})
-    S.limitOption = settings:AddSlider("GBLimit", {Text = "Tile limit (0 = all)", Min = 0, Max = 5000, Default = 0, Rounding = 0,
-        Callback = function(v) S.config.limit = v end})
-    button(settings, "Calibrate movement", API.CalibrateGrounded)
-    button(settings, "Load checkpoint", API.LoadCheckpoint)
-    local dirtSettings = group(cfg, "Right", "Dirt builder", "layers")
-    dirtSettings:AddSlider("GBDirtRowLimit", {Text = "Floor limit (0 = all)", Min = 0, Max = 25, Default = 0, Rounding = 0,
-        Callback = function(v) S.dirt.config.rowLimit = math.floor(v) end})
-    dirtSettings:AddSlider("GBDirtInterval", {Text = "Place interval", Min = 0.25, Max = 1, Default = 0.25, Rounding = 2,
-        Callback = function(v) S.dirt.config.interval = v end})
-    local session = group(cfg, "Right", "Session", "moon")
-    session:AddLabel("RightShift: menu | End: stop")
-    button(session, "Unload", API.Unload)
+    -- Settings intentionally contains only the library's configuration system.
+    local configOK, configError = pcall(function()
+        for name, fn in {isfolder=isfolder, isfile=isfile, listfiles=listfiles, makefolder=makefolder,
+            readfile=readfile, writefile=writefile, delfile=delfile} do
+            assert(type(fn)=="function", "Executor filesystem API unavailable: " .. name)
+        end
+        assert(type(isfolder)=="function" and type(isfile)=="function" and type(listfiles)=="function"
+            and type(makefolder)=="function" and type(readfile)=="function" and type(writefile)=="function"
+            and type(delfile)=="function", "Executor does not support the required config file APIs")
+        local manager = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/Alexandria/main/addons/SaveManager.lua"))()
+        setupConfigManager(manager, library, cfg)
+    end)
+    if not configOK then
+        S.configSystem = {ready = false, error = tostring(configError)}
+        group(cfg, "Right", "Configuration", "folder-cog"):AddLabel("Config unavailable: " .. tostring(configError), true)
+    end
     task.spawn(function()
         while S.live do
             flushToggleRequests()
