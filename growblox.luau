@@ -1,4 +1,4 @@
--- Growblox v0.9 | DEMO-BASED DIRT BUILDER | native A/D/Space only
+-- Growblox v0.12 | MANIFEST AUTO FARM | native A/D/Space only
 -- UI adapted from ../hush/UI_GUIDE.md and scripts/hush.luau.
 -- Starts idle. Never changes ItemDB or clears on load. Probe instrumentation is scoped/restored.
 local E = getgenv()
@@ -16,14 +16,17 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.11-privacy", live = true, running = false, busy = false,
+    version = "0.12-autofarm", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil, uiRequests = {},
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
         verifyEvery = 20, alternative = "punch-burst"},
     privacy = {hideName = true, hideWorld = true, alias = "Blizzard Hub", revision = 0, active = false},
     utilities = {ultraFPS = false, leaveStaff = false, leaveCount = false, maxPeople = 3, present = {}, hooks = {}, fpsSaved = {}, fpsConnections = {}, leaving = false},
-    farm = {running = false, config = {loot = false}}, -- cancelled; no Auto Farm worker/UI
+    farm = {running = false, config = {loot = false, item = 954, harvestMode = "Bertahap"},
+        phase = "prepare", cursor = 1, message = "Preview before starting", manifest = {}, trees = {}, deferred = {},
+        moves = 0, distance = 0, cycle = 0, placed = 0, broken = 0, planted = 0, harvested = 0,
+        checkpointFile = "growblox-autofarm-v1.json", interval = 0.24},
     dirt = {running = false, phase = "Preview before starting", placed = 0, floors = 0,
         checkpointFile = "growblox-dirt-builder-checkpoint.json", config = {topY = 3, interval = 0.25, rowLimit = 0}},
     specialDirt = {running = false, phase = "Preview before starting", placedPlatforms = 0, placedDirt = 0, mined = 0, floors = 0,
@@ -199,7 +202,8 @@ local function flushToggleRequests()
         local field,flag
         if key=="clear" then field,flag="clearToggle","changingClearToggle"
         elseif key=="dirt" then field,flag="dirtToggle","changingDirtToggle"
-        elseif key=="specialDirt" then field,flag="specialDirtToggle","changingSpecialDirtToggle" end
+        elseif key=="specialDirt" then field,flag="specialDirtToggle","changingSpecialDirtToggle"
+        elseif key=="farm" then field,flag="farmToggle","changingFarmToggle" end
         local control=field and S[field]
         if control then
             S[flag]=true
@@ -212,6 +216,9 @@ local function flushToggleRequests()
 end
 function API.Stop(reason)
     S.farm.running = false
+    S.farm.testSlotLimit=nil
+    if API.SaveAutoFarmCheckpoint then API.SaveAutoFarmCheckpoint() end
+    requestToggle("farm",false)
     if S.dirt.running and not (type(reason)=="string" and reason:sub(1,10)=="Dirt Farm:") then
         S.dirt.phase="Paused: "..(type(reason)=="string" and reason or "manual stop")
     end
@@ -231,7 +238,8 @@ function API.Stop(reason)
     S.running = false
     S.generation = (S.generation or 0) + 1
     releaseMovement()
-    if S.worker then pcall(task.cancel, S.worker); S.worker = nil end
+    if S.worker and S.worker~=coroutine.running() then pcall(task.cancel, S.worker) end
+    S.worker = nil
     S.busy = false
     if S.progress and not S.progress.complete then S.progress.state = "Paused"; S.progress.finishedAt = os.clock() end
     if API.SaveCheckpoint then API.SaveCheckpoint() end
@@ -322,7 +330,7 @@ local function bedrockComponent(x,y)
 end
 API.BedrockInfo=bedrockComponent
 local function canStand(x, y)
-    if not (x >= 0 and x < world.w and y >= 1 and y < world.h and passable(tile(0, x, y))) then return false end
+    if not (x >= 0 and x < world.w and y >= (S.farm.running and 0 or 1) and y < world.h and passable(tile(0, x, y))) then return false end
     -- Native farming demo and the Main Door spawn both stand in a one-cell
     -- clear corridor below a solid ceiling. Do not impose a two-cell body on
     -- this mode; the real game still performs all collisions via normal input.
@@ -1687,7 +1695,9 @@ local function dirtWalk(x, floorY, generation)
         for sx=math.min(math.floor(px),x),math.max(math.floor(px),x) do
             local floor=DB[tile(0,sx,floorY) or 0]
             assert(floor and not floor.hurts and (floor.solid or floor.platform), "Gap/hazard in the lower support floor")
-            assert(passable(tile(0,sx,floorY-1)), "Walking corridor contains a block/tree; preserved")
+            local corridorID=tile(0,sx,floorY-1)
+            local ownedEntrance=S.farm.running and DB[corridorID] and DB[corridorID].entrance and accessible(sx,floorY-1)
+            assert(passable(corridorID) or ownedEntrance, "Walking corridor contains a block/tree; preserved")
         end
         local began,lastX,lastProgress = os.clock(),px,os.clock()
         repeat
@@ -2530,6 +2540,766 @@ end
 local privacyOK,privacyError=pcall(API.InstallPrivacy)
 if not privacyOK then S.privacy.error=tostring(privacyError) end
 
+-- AUTO FARM V1: deterministic planner and resumable, one-action-at-a-time engine.
+do
+-- FARM_CORE_BEGIN (also exercised verbatim by the offline integration fixture)
+local FarmCore = {}
+function FarmCore.layout(fg, db, width, height, selected)
+    local p = {rows = {}, slots = {}, excluded = {}, left = 1, right = width - 2, fingerprint = 1}
+    for sy = height - 2, 1, -1 do
+        if fg[sy] and fg[sy][p.left] == 102 and fg[sy][p.right] == 102 then
+            local row = {floor = sy, y = sy - 1, direction = #p.rows % 2 == 0 and 1 or -1}
+            p.rows[#p.rows + 1] = row
+            local first, last = row.direction == 1 and 2 or width - 3, row.direction == 1 and width - 3 or 2
+            for x = first, last, row.direction do
+                local support, id = fg[sy][x], fg[sy - 1] and fg[sy - 1][x]
+                p.fingerprint=(p.fingerprint*31+(support or -1)+sy+x)%2147483647
+                local d = db[support]
+                if d and not d.hurts and not d.lock and not d.entrance and support ~= 8
+                    and (d.solid or d.platform) and (id == 0 or id == selected or id == selected + 1) then
+                    p.slots[#p.slots + 1] = {x = x, y = sy - 1, floor = sy, row = #p.rows, direction = row.direction, support = support}
+                else p.excluded[#p.excluded + 1] = {x = x, y = sy - 1, id = id, support = support} end
+            end
+        end
+    end
+    p.capacity = #p.slots
+    return p
+end
+function FarmCore.key(t) return tostring(t.x) .. ":" .. tostring(t.y) end
+function FarmCore.ready(t, seed, now)
+    -- Native updateTrees uses server time, record.p and ItemDB[record.id].grow.
+    return t and t.id == seed.id and type(t.p) == "number" and now >= t.p + seed.grow
+end
+function FarmCore.step(f, e)
+    local id, seed = f.config.item, f.config.item + 1
+    local function phase(name) f.phase = name; f.cursor = 1; f.waitReason=nil end
+    if f.phase == "prepare" then
+        local counts = e.inventory()
+        f.plan = e.scan(); assert(#f.plan.rows > 0 and #f.plan.slots > 0, "No accessible farm slots")
+        f.cycle += 1
+        if next(f.trees) then phase("wait"); return end
+        f.remaining = (counts[id] or 0) + e.stored(id) + e.reserved(id)
+        f.manifest, f.cashback = {}, 0
+        if f.remaining > 0 then phase("place")
+        elseif (counts[seed] or 0)+e.stored(seed)+e.reserved(seed)>0 then phase("plant")
+        else phase("materials") end
+    elseif f.phase=="materials" then
+        local counts=e.inventory()
+        if (counts[id] or 0)+(counts[seed] or 0)+e.stored(id)+e.stored(seed)+e.reserved(id)+e.reserved(seed)>0 then phase("prepare")
+        else f.waitReason="Waiting for selected block / seed";e.idle(1) end
+    elseif f.phase == "place" then
+        local t = f.plan.slots[f.cursor]
+        if not t or f.remaining <= 0 then phase("break"); return end
+        if not f.pending and e.canFill and not e.canFill(t) then phase("break");return end
+        local k = FarmCore.key(t)
+        if not f.pending and e.tile(t) ~= 0 then f.cursor += 1; return end
+        if not f.pending then
+            if (e.inventory()[id] or 0) == 0 then assert(e.fetch(id), "Waiting for scheduled block stock"); return end
+            f.pending = {kind = "place", target = t, id = id, before = e.inventory()[id] or 0}
+            e.save()
+        end
+        assert(e.place(f.pending), "Waiting for placement acknowledgement; no blind resend")
+        f.manifest[#f.manifest + 1] = {x = t.x, y = t.y, floor = t.floor, row = t.row, direction = t.direction, support = t.support, id = id}
+        f.pending = nil; f.remaining -= 1; f.placed += 1; f.cursor += 1
+    elseif f.phase == "break" then
+        local t = f.manifest[f.cursor]
+        if not t then phase("loot"); return end
+        if not t.done then
+            assert(e.remove(t, false), "Block removal not acknowledged")
+            t.done = true; f.broken += 1; e.save()
+        end
+        e.loot(); f.cursor += 1
+    elseif f.phase == "loot" then
+        assert(e.sweep(), "Waiting for batch drops / storage")
+        for _, t in f.manifest do assert(e.tile(t) == 0, "A batch block reappeared; preserved for reconciliation") end
+        -- Include native auto-pickups as well as explicit takes. No harvest is
+        -- allowed during this phase, so this finite pool is unused stock+cashback.
+        f.remaining = e.pool and e.pool(id) or ((f.remaining or 0) + (f.cashback or 0))
+        f.manifest, f.cashback = {}, 0
+        if f.remaining > 0 then phase("place") else phase("plant") end
+    elseif f.phase == "plant" then
+        local t = f.plan.slots[f.cursor]
+        if not t then phase("wait"); return end
+        if not f.pending and e.tile(t) ~= 0 then f.cursor += 1; return end
+        if not f.pending then
+            if (e.inventory()[seed] or 0) == 0 and not e.fetch(seed) then phase("wait"); return end
+            f.pending = {kind = "plant", target = t, id = seed, before = e.inventory()[seed] or 0}
+            e.save()
+        end
+        assert(e.place(f.pending), "Waiting for planting acknowledgement; no blind resend")
+        f.trees[FarmCore.key(t)] = t
+        f.pending = nil; f.planted += 1; f.cursor += 1
+    elseif f.phase == "wait" then
+        local total, ripe, eta, soonest = 0, 0, 0, math.huge
+        for _, t in f.trees do
+            local tree = e.tree(t)
+            assert(tree and tree.id == seed, "Tracked tree missing/changed; inspect before resume")
+            total += 1
+            if e.ripe(tree) then ripe += 1 else local remaining=e.eta(tree);eta=math.max(eta,remaining);soonest=math.min(soonest,remaining) end
+        end
+        if f.config.harvestMode=="Bertahap" then eta=ripe>0 and 0 or (soonest==math.huge and 0 or soonest) end
+        f.totalTrees, f.ripeTrees, f.eta = total, ripe, eta
+        if total == 0 then
+            assert(e.sweep(), "Waiting for final harvest loot")
+            phase("prepare"); e.idle(1)
+        elseif ripe > 0 and (f.config.harvestMode == "Bertahap" or ripe == total) then phase("harvest")
+        else e.idle(math.min(2, math.max(0.2, eta))) end
+    elseif f.phase == "harvest" then
+        local t = f.plan.slots[f.cursor]
+        if not t then phase("wait"); return end
+        local k = FarmCore.key(t)
+        if f.trees[k] then
+            local tree = e.tree(t)
+            assert(tree and tree.id == seed, "Tracked harvest tree changed")
+            if e.ripe(tree) then
+                assert(e.remove(t, true), "Harvest not acknowledged")
+                f.trees[k] = nil; f.harvested += 1; e.save(); e.loot()
+            end
+        end
+        f.cursor += 1
+    else error("Unknown farm phase; checkpoint refused") end
+    e.save()
+end
+-- FARM_CORE_END
+
+local f = S.farm
+E.BlizzardFarmSafety=E.BlizzardFarmSafety or {}
+local seedDB, treeData
+local function bindTrees()
+    for _, listener in Net.treeChanged.getListeners() do
+        if debug.info(listener,"s") == gameSource then
+            for _, fun in debug.getupvalues(listener) do
+                if type(fun)=="function" and debug.info(fun,"n")=="setTree" then treeData=debug.getupvalue(fun,2) end
+            end
+        end
+    end
+    assert(type(treeData)=="table", "Native tree registry unavailable")
+end
+local function treeAt(t)
+    local raw=treeData and treeData[t.y * world.w + t.x]
+    local id=tile(0,t.x,t.y)
+    -- Native registry is {p=serverPlantedTime,f=fruitCount}, not {id=...}.
+    -- The seed identity lives in foreground; join them without altering either.
+    if raw and DB[id] and DB[id].kind=="seed" then return {id=id,p=raw.p,fruit=raw.f} end
+    return nil
+end
+local function boxRecords(x,y) return world.displays.get(x,y) or {} end
+local function recordId(v) return tonumber(v.i or v.id or v[1]) end
+local function recordN(v) return tonumber(v.c or v.n or v[2]) or 0 end
+local function boxTotal(id)
+    local x = DB[id] and DB[id].kind=="seed" and 0 or world.w-1
+    local n=0
+    for _,v in boxRecords(x,f.baseFloor) do if recordId(v)==id then n+=recordN(v) end end
+    return n
+end
+local function selectedDrop(d)
+    return type(d.uid)=="number" and not d.display and (d.id==f.config.item or d.id==f.config.item+1 or (DB[d.id] and DB[d.id].kind=="gem"))
+end
+local function syncDeferred()
+    local seen, out={},{}
+    for _,d in world.dropList() do if selectedDrop(d) then
+        local key=tostring(d.uid);seen[key]=true
+        local old=f.deferred[key]
+        out[key]={uid=d.uid,id=d.id,n=d.n or 1,x=d.x,y=d.y,reserved=old and old.reserved or false}
+    end end
+    f.deferred=out
+end
+local function applyTake(uid,before,got)
+    local list=world.dropList()
+    for i,d in list do if d.uid==uid and d.n==before then
+        if got>=before then
+            if d.frame then pcall(function() d.frame:Destroy() end) end
+            table.remove(list,i)
+        else d.n=before-got end
+        break
+    end end
+end
+local function farmSave()
+    if not f.boundWorld or type(writefile)~="function" then return end
+    local out={version=1,world=f.boundWorld,user=game.Players.LocalPlayer.UserId,config=f.config,phase=f.phase,
+        manifest=f.manifest,trees=f.trees,deferred=f.deferred,remaining=f.remaining,cashback=f.cashback,
+        cursor=f.cursor,pending=f.pending,cycle=f.cycle,placed=f.placed,broken=f.broken,planted=f.planted,harvested=f.harvested}
+    local ok,err=pcall(function() writefile(f.checkpointFile,game:GetService("HttpService"):JSONEncode(out)) end)
+    f.checkpointError=not ok and tostring(err) or nil
+end
+API.SaveAutoFarmCheckpoint=farmSave
+local function checkSession()
+    assert(active(f.generation) and f.running,"Farm stopped/world changed")
+    assert(world.respawnedAt==f.respawnedAt,"Respawn detected; inspect position and resume explicitly")
+end
+local routeFarm
+local function walkClear(a,b,floor)
+    for x=math.min(a,b),math.max(a,b) do
+        local id=tile(0,x,floor-1)
+        local d=DB[id]
+        if not passable(id) and not (d and d.entrance and accessible(x,floor-1)) then return false end
+    end
+    return true
+end
+local function farmWalk(x, floor)
+    checkSession()
+    assert(world.fg[floor] and world.fg[floor][x]~=nil,"Invalid farm stance")
+    -- A legal landing can leave the centre in the shaft while one foot touches
+    -- the platform. Align that real contact before the builder's cell checks.
+    local px,py=position()
+    if grounded() and math.abs(py-floor)<0.25 and (px<1.1 or px>world.w-1.1) then
+        local began=os.clock()
+        repeat
+            checkSession();px,py=position()
+            inputKey(Enum.KeyCode.D,px<1.15);inputKey(Enum.KeyCode.A,px>world.w-1.15)
+            task.wait(0.015)
+        until (px>=1.15 and px<=world.w-1.15) or os.clock()-began>1
+        releaseMovement()
+    end
+    px=position()
+    if not walkClear(math.clamp(math.floor(px),1,world.w-2),x,floor) then
+        assert(routeFarm,"Farm navigation not initialized")
+        return routeFarm(x,floor)
+    end
+    -- The builder's grounded walker already supports one-tile corridors and real input.
+    dirtWalk(x,floor,f.generation)
+    checkSession()
+end
+local function farmJump(edge,target)
+    for _=1,3 do
+        checkSession()
+        local _,sy=position()
+        if grounded() and math.abs(sy-target)<0.25 then return end
+        assert(grounded() and sy-target<=2.3 and sy>target,"Unsafe jump launch")
+        inputKey(Enum.KeyCode.Space,true)
+        local began=os.clock()
+        repeat
+            checkSession()
+            local px,py=position()
+            inputKey(Enum.KeyCode.A,px>edge+0.65);inputKey(Enum.KeyCode.D,px<edge+0.35)
+            if os.clock()-began>0.2 then inputKey(Enum.KeyCode.Space,false) end
+            if os.clock()-began>0.25 and grounded() and math.abs(py-target)<0.25 then releaseMovement();return end
+            if os.clock()-began>0.3 and grounded() and py<sy-0.35 and tile(0,edge,math.floor(py+0.2))==102 then
+                releaseMovement();return -- short bay jumps may land one platform higher; caller reobserves
+            end
+            task.wait(0.015)
+        until os.clock()-began>2.5
+        releaseMovement();task.wait(0.2)
+    end
+    error("Native farm jump did not land on target platform")
+end
+local function descend(edge, target)
+    local outer=edge==1 and 0 or world.w-1
+    local _,py=position()
+    local current=math.floor(py+0.2)
+    while current<target do
+        local nextFloor=math.min(target,current+2)
+        farmWalk(edge,current)
+        inputKey(edge==1 and Enum.KeyCode.A or Enum.KeyCode.D,true)
+        local began=os.clock()
+        repeat
+            checkSession();local px=position()
+            if math.abs(px-(outer+0.5))<0.18 then break end
+            task.wait(0.015)
+        until os.clock()-began>1.5
+        releaseMovement()
+        began=os.clock()
+        repeat
+            checkSession()
+            local px,ay=position()
+            -- Turn back immediately after feet pass below the previous platform.
+            if ay>current+0.02 then
+                inputKey(Enum.KeyCode.A,px>edge+0.66);inputKey(Enum.KeyCode.D,px<edge+0.34)
+            end
+            if grounded() and ay>current+0.35 then
+                releaseMovement()
+                task.wait(0.12)
+                break
+            end
+            task.wait(0.015)
+        until os.clock()-began>3
+        releaseMovement()
+        local _,landed=position()
+        local actual=math.floor(landed+0.2)
+        assert(grounded() and math.abs(landed-actual)<0.25,"Native edge descent did not land")
+        if actual==f.baseFloor+1 then return end -- bay landing is recovered by the outer observed-state router
+        assert(actual>current and world.fg[actual] and world.fg[actual][edge]==102,"Landing outside platform graph")
+        current=actual -- reconcile a missed platform using the observed landing, not a stale row cursor
+    end
+end
+local function reachFloor(target,edge)
+    checkSession()
+    for _=1,#f.plan.rows*3+3 do
+        local px,py=position()
+        assert(grounded(),"Waiting for physical landing")
+        local current=math.floor(py+0.2)
+        if current==target then return end
+        if current==f.baseFloor+1 and (px<2 or px>world.w-2) then farmJump(edge,f.baseFloor)
+        else
+            assert(current%2==target%2,"Avatar is not on this farm's support graph")
+            if current<target then descend(edge,target)
+            else farmWalk(edge,current);farmJump(edge,current-2) end
+        end
+    end
+    error("Platform route made no reliable progress; inspect physical landing")
+end
+routeFarm=function(x,floor)
+    local px,py=position()
+    local current=math.floor(py+0.2)
+    assert(current==floor,"Reroute must start on the target floor")
+    local start=math.clamp(math.floor(px),1,world.w-2)
+    local best
+    for _,exit in {1,world.w-2} do if walkClear(start,exit,current) then
+        for _,entry in {1,world.w-2} do if walkClear(entry,x,floor) then
+            for _,row in f.plan.rows do
+                if row.floor~=floor and walkClear(1,world.w-2,row.floor) then
+                    local cost=math.abs(start-exit)+math.abs(entry-x)+2*math.abs(row.floor-floor)+world.w
+                    if not best or cost<best.cost then best={exit=exit,entry=entry,floor=row.floor,cost=cost} end
+                end
+            end
+        end end
+    end end
+    assert(best,"No safe crossing floor; keep batch intact and inspect")
+    farmWalk(best.exit,current)
+    reachFloor(best.floor,best.exit)
+    farmWalk(best.entry,best.floor)
+    reachFloor(floor,best.entry)
+    farmWalk(x,floor)
+end
+local function moveTo(t,placing)
+    local _,py=position()
+    local current=math.floor(py+0.2)
+    local edge=t.direction==1 and 1 or world.w-2
+    if current~=t.floor then reachFloor(t.floor,edge) end
+    local id=placing and f.config.item or tile(0,t.x,t.y)
+    -- Place solids behind the avatar; mine/harvest from the unfilled side.
+    local px=position()
+    local stance
+    if placing then stance=DB[id] and DB[id].solid and t.x+t.direction or t.x-t.direction
+    else stance=px>t.x+0.5 and t.x+1 or t.x-1 end
+    if not placing and tile(0,t.x,t.y)==0 then return end
+    if not passable(tile(0,stance,t.y)) then
+        local other=stance==t.x+1 and t.x-1 or t.x+1
+        assert(passable(tile(0,other,t.y)),"No safe stance beside target; preserve it")
+        stance=other
+    end
+    farmWalk(stance,t.floor)
+    assert(accessible(t.x,t.y) and inRange(t.x,t.y),"Target permission/range changed")
+end
+local function inventoryNow() f.counts=refreshLootInventory();return f.counts end
+local function waitStock(id,before,delta)
+    for _=1,6 do
+        checkSession();task.wait(0.15)
+        local counts=inventoryNow()
+        if (counts[id] or 0)==before+delta then return true end
+    end
+    return false
+end
+local function store(id,amount)
+    local counts=inventoryNow();local have=counts[id] or 0;local n=math.min(have,amount or have)
+    if n==0 then return true end
+    local x=DB[id].kind=="seed" and 0 or world.w-1
+    local edge=x==0 and 1 or world.w-2
+    reachFloor(f.baseFloor,edge);farmWalk(edge,f.baseFloor)
+    assert(tile(0,x,f.baseFloor)==1422,"Storage box removed/changed")
+    local beforeBox=boxTotal(id)
+    local mixed=false
+    for _,v in boxRecords(x,f.baseFloor) do if recordId(v)~=id then mixed=true end end
+    if not mixed then world.displayPut(x,f.baseFloor,id,n,0.5);restoreExecutorContext() end
+    local accepted=not mixed and waitStock(id,have,-n)
+    if accepted and boxTotal(id)==beforeBox+n then f.stored=(f.stored or 0)+n;return true end
+    -- A partially accepted deposit is reconciled, never duplicated as a full drop.
+    counts=inventoryNow();local left=counts[id] or 0
+    if left==0 then error("Deposit inventory changed but box not confirmed; inspect storage") end
+    local dropCallback
+    for _,fn in filtergc("function",{Constants={"lastDropAt","displayHere"}},false) do
+        if debug.info(fn,"s")==gameSource then dropCallback=fn;break end
+    end
+    assert(dropCallback,"Box refused and native drop callback unavailable")
+    -- Stand inside the outer shaft ABOVE the box: normal game drop logic decides
+    -- whether to store or create a loose drop. Never bypass its restrictions.
+    local fallback=math.min(left,math.max(0,n-(have-left)))
+    assert(fallback>0,"Partial deposit needs storage reconciliation")
+    dropCallback(id,fallback)
+    restoreExecutorContext()
+    assert(waitStock(id,left,-fallback),"Box/drop refused; waiting, toggle remains ON")
+    syncDeferred()
+    for _,v in f.deferred do if v.id==id then v.reserved=true end end
+    f.storageWarning="Box refused; normal drop fallback used; loose items tracked"
+    return true
+end
+local function fetch(id)
+    if (inventoryNow()[id] or 0)>0 then return true end
+    local x=DB[id].kind=="seed" and 0 or world.w-1
+    local records=boxRecords(x,f.baseFloor)
+    if boxTotal(id)>0 then
+        for _,v in records do assert(recordId(v)==id,"Storage contains other items; preserved") end
+        local edge=x==0 and 1 or world.w-2
+        reachFloor(f.baseFloor,edge);farmWalk(edge,f.baseFloor)
+        local before=boxTotal(id)
+        world.displayTake(x,f.baseFloor,0.5);restoreExecutorContext()
+        for _=1,8 do
+            checkSession();task.wait(0.15)
+            local n=inventoryNow()[id] or 0
+            if n>0 and n<=200 and boxTotal(id)==before-n then return true end
+        end
+        error("Withdraw not confirmed; inspect box before retry")
+    end
+    syncDeferred()
+    for _,d in f.deferred do if d.id==id and d.reserved then
+        local row
+        for _,r in f.plan.rows do if math.abs(d.y-r.floor)<1.6 then row=r;break end end
+        assert(row,"Stored loose drop is outside safe farm route")
+        reachFloor(row.floor,d.x<world.w/2 and 1 or world.w-2)
+        farmWalk(math.clamp(math.floor(d.x),1,world.w-2),row.floor)
+        local got=world.takeDrop(d.uid,math.min(200,d.n));restoreExecutorContext()
+        assert(type(got)=="number","Unexpected reserved-drop reply")
+        if got>0 then applyTake(d.uid,d.n,got) end
+        return (inventoryNow()[id] or 0)>0
+    end end
+    return false
+end
+local function loot()
+    checkSession()
+    local counts=inventoryNow()
+    for _,id in {f.config.item,f.config.item+1} do if (counts[id] or 0)>=180 then store(id) end end
+    local px,py=position()
+    for _,d in table.clone(world.dropList()) do
+        if selectedDrop(d) and not d.pending and not (f.deferred[tostring(d.uid)] and f.deferred[tostring(d.uid)].reserved)
+            and (d.x-px)^2+(d.y-py)^2<=2.2^2 then
+            counts=inventoryNow()
+            local gem=DB[d.id] and DB[d.id].kind=="gem"
+            local want=gem and 65535 or math.max(0,200-(counts[d.id] or 0))
+            if want>0 then
+                local beforeN=d.n or 1
+                local got=world.takeDrop(d.uid,math.min(want,d.n or 1));restoreExecutorContext()
+                assert(type(got)=="number","Unexpected loot response")
+                if got>0 then
+                    if d.id==f.config.item and (f.phase=="break" or f.phase=="loot") then f.cashback=(f.cashback or 0)+got end
+                    if gem then f.gems=(f.gems or 0)+got end
+                    -- Native world.takeDrop doesn't update client visuals; apply its own
+                    -- acknowledgement handler only after the server returned the count.
+                    applyTake(d.uid,beforeN,got)
+                end
+            end
+        end
+    end
+    syncDeferred();inventoryNow()
+end
+local function sweep()
+    for _=1,20 do
+        checkSession()
+        local pending=false
+        for _,d in world.dropList() do if selectedDrop(d) and d.pending then pending=true;break end end
+        if not pending then break end
+        task.wait(0.1)
+    end
+    for _,d in world.dropList() do if selectedDrop(d) and d.pending then return false end end
+    loot()
+    local targets={}
+    for _,d in f.deferred do if not d.reserved then targets[#targets+1]=d end end
+    table.sort(targets,function(a,b) return a.y>b.y or (a.y==b.y and a.x<b.x) end)
+    for _,d in targets do
+        checkSession()
+        local row
+        for _,r in f.plan.rows do if math.abs(d.y-r.floor)<1.6 then row=r;break end end
+        assert(row,"A drop is outside the safe route; waiting for inspection")
+        reachFloor(row.floor,d.x<world.w/2 and 1 or world.w-2)
+        local sx=math.clamp(math.floor(d.x),1,world.w-2)
+        if passable(tile(0,sx,row.y)) then farmWalk(sx,row.floor) else error("Drop route occupied; retained in tracking") end
+        loot()
+    end
+    syncDeferred()
+    for _,d in f.deferred do if not d.reserved then return false end end
+    return true
+end
+local function scan()
+    bindTrees()
+    local p=FarmCore.layout(world.fg,DB,world.w,world.h,f.config.item)
+    assert(#p.rows>0,"Dirt farm platforms not found")
+    f.baseFloor=p.rows[1].floor
+    assert(tile(0,0,f.baseFloor)==1422 and tile(0,world.w-1,f.baseFloor)==1422,"Two bottom Display Boxes required")
+    for _,t in p.slots do if not accessible(t.x,t.y) then t.noAccess=true end end
+    local allowed={}
+    for _,t in p.slots do if not t.noAccess then allowed[#allowed+1]=t end end
+    p.slots=allowed;p.capacity=#allowed
+    if f.testSlotLimit then
+        while #p.slots>f.testSlotLimit do table.remove(p.slots) end
+    end
+    return p
+end
+local function put(p)
+    checkSession()
+    local t=p.target
+    assert(tile(0,t.x,t.floor)==t.support,"Support changed; preserved")
+    if not p.sent then
+        assert(tile(0,t.x,t.y)==0,"Target occupied; no overwrite/splice")
+        moveTo(t,true)
+        assert(tile(0,t.x,t.y)==0 and not treeAt(t),"Target changed during movement")
+        p.before=inventoryNow()[p.id] or 0
+        assert(p.before>0,"No stock for placement")
+        p.sent=true;farmSave()
+        nativeSetTile("fg",t.x,t.y,p.id)
+    end
+    local stock=waitStock(p.id,p.before,-1)
+    task.wait(0.25)
+    if p.kind=="plant" then
+        -- A server tree record confirms planting even when an automatic seed
+        -- pickup happened in the same interval and cancelled the visible delta.
+        local tree=treeAt(t)
+        return tree and tree.id==p.id and type(tree.p)=="number"
+    end
+    return stock and tile(0,t.x,t.y)==p.id
+end
+local function remove(t,harvest)
+    checkSession()
+    local expected=harvest and f.config.item+1 or f.config.item
+    if tile(0,t.x,t.y)==0 and not treeAt(t) then return true end
+    assert(tile(0,t.x,t.y)==expected,"Unrelated target replaced batch member; preserved")
+    if harvest then assert(treeAt(t) and FarmCore.ready(treeAt(t),seedDB,workspace:GetServerTimeNow()),"Tree isn't ripe") end
+    moveTo(t,false)
+    -- Only this foreground crop is eligible. No call may fall through to background.
+    for attempt=1,(DB[expected].hits or 1)*3+6 do
+        checkSession()
+        if tile(0,t.x,t.y)~=expected then break end
+        assert(accessible(t.x,t.y) and inRange(t.x,t.y) and grounded(),"Unsafe crop hit stance")
+        hit(t.x,t.y);S.nativeCalls+=1
+        task.wait(f.interval)
+        if attempt>math.max(2,DB[expected].hits or 1) then f.interval=math.min(0.6,f.interval+0.05) end
+    end
+    task.wait(0.35)
+    return tile(0,t.x,t.y)==0 and (not harvest or not treeAt(t))
+end
+local env={inventory=inventoryNow,scan=scan,stored=boxTotal,fetch=fetch,tile=function(t)return tile(0,t.x,t.y)end,
+    place=put,remove=remove,tree=treeAt,loot=loot,sweep=sweep,save=farmSave,
+    ripe=function(tree)return FarmCore.ready(tree,seedDB,workspace:GetServerTimeNow())end,
+    eta=function(tree)return math.max(0,tree.p+seedDB.grow-workspace:GetServerTimeNow())end,
+    pool=function(id) syncDeferred();local n=(inventoryNow()[id] or 0)+boxTotal(id);for _,d in f.deferred do if d.id==id then n+=d.n end end;return n end,
+    canFill=function(t)
+        if not DB[f.config.item].solid then return true end
+        -- Keep at least one entire crossing corridor free for the return to the
+        -- first placed block. Planting can use every row after the break phase.
+        for _,row in f.plan.rows do if row.floor~=t.floor and walkClear(1,world.w-2,row.floor) then return true end end
+        return false
+    end,
+    reserved=function(id) syncDeferred();local n=0 for _,d in f.deferred do if d.id==id and d.reserved then n+=d.n end end return n end,
+    idle=function(seconds) releaseMovement();task.wait(seconds) end}
+API.AutoFarmCore=FarmCore
+function API.PreviewAutoFarm()
+    assert(not S.running and not S.busy,"Stop other automation before preview")
+    assert(DB[f.config.item] and DB[f.config.item].farmable and DB[f.config.item+1] and DB[f.config.item+1].kind=="seed","Select a farmable block/seed pair")
+    f.plan=scan();assert(f.plan.capacity>0,"No accessible crop slots");f.counts=inventoryNow();syncDeferred()
+    local safety=E.BlizzardFarmSafety[f.config.item]
+    local validated=safety and safety.world==world.name and safety.job==game.JobId and safety.fingerprint==f.plan.fingerprint
+    local blocked=(DB[f.config.item].hurts or DB[f.config.item].solid) and not validated
+    f.message=blocked and "Solid/hazard item locked pending live safety validation" or "Ready - toggle ON"
+    return {world=world.name,rows=#f.plan.rows,capacity=f.plan.capacity,excluded=f.plan.excluded,counts=f.counts,
+        seedStored=boxTotal(f.config.item+1),blockStored=boxTotal(f.config.item),ready=not blocked,
+        reason=blocked and f.message or nil}
+end
+function API.AutoFarmItems()
+    if not f.baseFloor then local ok,p=pcall(scan);if ok then f.plan=p end end
+    local candidates={[f.config.item]=true}
+    for _,v in inventory.slots do local id=DB[v.id] and DB[v.id].kind=="seed" and v.id-1 or v.id;candidates[id]=true end
+    if f.baseFloor then for _,x in {0,world.w-1} do for _,v in boxRecords(x,f.baseFloor) do local id=recordId(v);if id then candidates[DB[id] and DB[id].kind=="seed" and id-1 or id]=true end end end end
+    local labels,map={},{}
+    for id in candidates do if DB[id] and DB[id].farmable and DB[id+1] and DB[id+1].kind=="seed" then
+        local label=DB[id].name.." ["..id.."]";labels[#labels+1]=label;map[label]=id
+    end end
+    table.sort(labels);return labels,map
+end
+function API.ConfigureAutoFarm(item,mode)
+    assert(not f.running,"Turn Auto Farm OFF before changing item/mode")
+    assert(mode=="Bertahap" or mode=="Tunggu Semua Matang","Unknown harvest mode")
+    assert(DB[item] and DB[item].farmable and DB[item+1] and DB[item+1].kind=="seed","Invalid farm item")
+    if item~=f.config.item then
+        if f.pending and not f.pending.sent and tile(0,f.pending.target.x,f.pending.target.y)==0 then f.pending=nil end
+        local unfinished=false
+        for _,t in f.manifest do if not t.done or tile(0,t.x,t.y)~=0 then unfinished=true end end
+        assert(not next(f.trees) and not unfinished and not f.pending,"Finish/resume the old batch before switching item")
+        f.manifest={}
+        f.phase="prepare";f.cursor=1;f.remaining=nil
+    end
+    f.config.item=item;f.config.harvestMode=mode
+end
+function API.LoadAutoFarmCheckpoint()
+    assert(not S.running and not S.busy,"Pause first")
+    assert(type(isfile)=="function" and isfile(f.checkpointFile),"No Auto Farm checkpoint")
+    local p=game:GetService("HttpService"):JSONDecode(readfile(f.checkpointFile))
+    assert(p.version==1 and p.world==world.name and p.user==game.Players.LocalPlayer.UserId,"Checkpoint belongs to another world/account")
+    assert(type(p.config)=="table" and p.config.item==f.config.item,"Select checkpoint's item first")
+    local plan=scan();local valid={}
+    for _,t in plan.slots do valid[FarmCore.key(t)]=t end
+    assert(({prepare=true,materials=true,place=true,["break"]=true,loot=true,plant=true,wait=true,harvest=true})[p.phase],"Invalid checkpoint phase")
+    assert(type(p.cursor)=="number" and p.cursor>=1 and p.cursor<=#plan.slots+1,"Invalid checkpoint cursor")
+    assert(p.config.harvestMode=="Bertahap" or p.config.harvestMode=="Tunggu Semua Matang","Invalid harvest mode")
+    for i,t in p.manifest or {} do
+        local canonical=valid[FarmCore.key(t)];assert(canonical and t.id==f.config.item,"Manifest no longer matches safe farm geometry")
+        local copy=table.clone(canonical);copy.id=f.config.item;copy.done=t.done==true;p.manifest[i]=copy
+    end
+    for k,t in p.trees or {} do
+        local canonical=valid[FarmCore.key(t)];assert(canonical and k==FarmCore.key(t) and treeAt(t) and treeAt(t).id==f.config.item+1,"Checkpoint tree changed")
+        p.trees[k]=table.clone(canonical)
+    end
+    if p.pending then
+        local canonical=valid[FarmCore.key(p.pending.target)]
+        assert(canonical and (p.pending.id==f.config.item or p.pending.id==f.config.item+1),"Invalid pending operation")
+        p.pending.target=table.clone(canonical)
+    end
+    for _,k in {"phase","manifest","trees","deferred","remaining","cashback","cursor","pending","cycle","placed","broken","planted","harvested"} do f[k]=p[k] end
+    f.config=p.config;f.plan=plan;f.boundWorld=world.name;f.message="Checkpoint loaded, OFF - toggle ON to resume"
+    return {phase=f.phase,manifest=#f.manifest}
+end
+function API.StopAutoFarm()
+    if f.running then API.Stop("Auto Farm OFF") end
+end
+function API.StartAutoFarm(options)
+    assert(not S.running and not S.busy,"Pause other automation first")
+    if not f.boundWorld and type(isfile)=="function" and isfile(f.checkpointFile) then
+        local p=game:GetService("HttpService"):JSONDecode(readfile(f.checkpointFile))
+        if p.world==world.name and p.user==game.Players.LocalPlayer.UserId then
+            local unfinished=p.pending or next(p.trees or {}) or #(p.manifest or {})>0 or (p.phase~="prepare" and p.phase~="wait")
+            if unfinished then
+                assert(p.config.item==f.config.item,"Unfinished checkpoint for another item; select that item and load checkpoint first")
+                API.LoadAutoFarmCheckpoint() -- restore paused work before creating any new manifest
+            end
+        end
+    end
+    local preview=API.PreviewAutoFarm();assert(preview.ready,preview.reason)
+    assert(nativeSetTile and not S.inputError,"Native placement/input unavailable")
+    seedDB={id=f.config.item+1,grow=DB[f.config.item+1].grow}
+    assert(type(seedDB.grow)=="number","Missing seed grow time")
+    if options then
+        for _,key in {"maxPlacements","slotLimit","maxCycles"} do
+            local n=options[key]
+            assert(n==nil or type(n)=="number" and n%1==0 and n>=1 and n<=3,"Diagnostic limits must be integers 1..3")
+        end
+    end
+    S.generation=(S.generation or 0)+1
+    f.generation=S.generation;f.boundWorld=world.name;S.boundWorld=world.name;f.respawnedAt=world.respawnedAt
+    f.testLimit=options and options.maxPlacements;f.testStartPlaced=f.placed
+    f.testSlotLimit=options and options.slotLimit
+    f.testCycleLimit=options and options.maxCycles;f.testStartCycle=f.cycle-(f.phase~="prepare" and 1 or 0)
+    if f.testSlotLimit then while #f.plan.slots>f.testSlotLimit do table.remove(f.plan.slots) end end
+    f.running,S.running,S.busy=true,true,true
+    requestToggle("farm",true)
+    S.worker=task.spawn(function()
+        local failures=0
+        while S.live and f.running do
+            local ok,err=xpcall(function()
+                checkSession()
+                if f.testLimit and f.phase=="place" and f.placed-f.testStartPlaced>=f.testLimit then
+                    f.remaining=0;f.phase="break";f.cursor=1
+                end
+                FarmCore.step(f,env)
+            end,debug.traceback)
+            releaseMovement()
+            if ok then failures=0;f.error=nil;f.message=f.waitReason or f.phase
+            else
+                failures+=1;f.error=tostring(err);f.message="Waiting: "..tostring(err):match("^[^\r\n]+")
+                farmSave()
+                if failures>=3 then
+                    f.needsAttention=true
+                    repeat task.wait(0.25) until not f.running or f.resumeRequested or not S.live
+                    f.resumeRequested=nil;f.needsAttention=false;failures=0
+                else task.wait(2^(failures-1)) end
+            end
+            if f.testLimit and f.phase=="loot" then f.message="Bounded test reached loot";API.Stop("Auto Farm bounded test");break end
+            if f.testCycleLimit and f.phase=="prepare" and f.cycle-f.testStartCycle>=f.testCycleLimit then
+                f.message="Bounded farm cycle complete";API.Stop("Auto Farm bounded cycle");break
+            end
+            task.wait(0.02)
+        end
+        releaseMovement();farmSave()
+    end)
+    return preview
+end
+function API.ResumeAutoFarm()
+    assert(f.running and f.needsAttention,"No waiting Auto Farm worker")
+    assert(world.name==f.boundWorld,"Return to the bound world first")
+    -- A respawn requires an explicit acknowledgement, never an automatic restart.
+    f.respawnedAt=world.respawnedAt;f.resumeRequested=true
+end
+-- Explicit bounded diagnostics; never invoked on load, by config, or by the UI.
+function API.ProbeAutoFarm(action,args)
+    assert(not S.running and not S.busy,"Pause automation before diagnostics")
+    args=args or {};f.plan=scan()
+    seedDB={id=f.config.item+1,grow=DB[f.config.item+1].grow}
+    S.generation=(S.generation or 0)+1;f.generation=S.generation
+    f.boundWorld=world.name;S.boundWorld=world.name;f.respawnedAt=world.respawnedAt
+    S.running,S.busy,f.running=true,true,true
+    local result={action=action,target=args,started=os.clock()}
+    local ok,err=xpcall(function()
+        if action=="navigate" then
+            local found=false for _,r in f.plan.rows do if r.floor==args.floor then found=true end end
+            assert(found and (args.edge==1 or args.edge==world.w-2),"Diagnostic target isn't a farm platform")
+            reachFloor(args.floor,args.edge)
+        elseif action=="deposit" then
+            assert(args.id==f.config.item or args.id==f.config.item+1,"Unselected diagnostic item")
+            assert(args.amount==1,"Diagnostic deposit limited to one item")
+            store(args.id,1)
+        elseif action=="withdraw" then
+            assert(args.id==f.config.item or args.id==f.config.item+1,"Unselected diagnostic item")
+            local before=inventoryNow()[args.id] or 0
+            local n=boxTotal(args.id)
+            assert(n==1 and before<200,"Withdraw diagnostic limited to a box containing one item")
+            local x=DB[args.id].kind=="seed" and 0 or world.w-1
+            for _,r in boxRecords(x,f.baseFloor) do assert(recordId(r)==args.id,"Other stored item preserved") end
+            local edge=x==0 and 1 or world.w-2
+            reachFloor(f.baseFloor,edge);farmWalk(edge,f.baseFloor)
+            world.displayTake(x,f.baseFloor,0.5);restoreExecutorContext()
+            assert(waitStock(args.id,before,1) and boxTotal(args.id)==0,"Withdraw diagnostic not confirmed")
+        elseif action=="safety" then
+            assert(not next(f.trees) and #f.manifest<=1 and not f.pending,"Finish current batch before safety calibration")
+            local target=f.plan.slots[1]
+            local member=f.manifest[1]
+            if member then
+                assert(f.phase=="break" and member.id==f.config.item and FarmCore.key(member)==FarmCore.key(target),"Only the tracked calibration block may resume")
+            else
+                assert(target and tile(0,target.x,target.y)==0,"Bottom-left calibration slot isn't empty")
+                assert((inventoryNow()[f.config.item] or 0)>0,"One block required for safety calibration")
+                f.pending={kind="place",target=target,id=f.config.item,before=f.counts[f.config.item]}
+                f.phase="place";farmSave()
+                assert(put(f.pending),"Safety placement not confirmed")
+                member=table.clone(target);member.id=f.config.item
+                f.manifest={member};f.pending=nil;f.phase="break";farmSave()
+            end
+            task.wait(0.75);checkSession()
+            local px,py=position()
+            assert(math.abs(px-target.x-0.5)>=0.9 and math.abs(py-target.floor)<0.25,"Unsafe distance from crop")
+            assert(remove(member,false),"Safety crop couldn't be removed")
+            member.done=true;f.manifest={};f.phase="prepare";f.cursor=1
+            loot();task.wait(0.4);checkSession()
+            E.BlizzardFarmSafety[f.config.item]={world=world.name,job=game.JobId,fingerprint=f.plan.fingerprint,at=os.clock()}
+            result.item=f.config.item;result.noRespawn=true;result.fingerprint=f.plan.fingerprint
+        elseif action=="plant" or action=="harvest" then
+            local target
+            for _,t in f.plan.slots do if t.x==args.x and t.y==args.y then target=t;break end end
+            assert(target,"Diagnostic target isn't a safe crop slot")
+            if action=="plant" then
+                local op={kind="plant",target=target,id=f.config.item+1,before=inventoryNow()[f.config.item+1] or 0}
+                f.pending=op;farmSave();assert(put(op),"Plant probe not confirmed")
+                f.pending=nil;f.trees[FarmCore.key(target)]=target
+                result.tree=treeAt(target)
+            else
+                assert(f.trees[FarmCore.key(target)],"Probe may only harvest its own tracked tree")
+                assert(remove(target,true),"Harvest probe not confirmed")
+                f.trees[FarmCore.key(target)]=nil;loot()
+            end
+        else error("Unknown bounded diagnostic action") end
+    end,debug.traceback)
+    result.ok=ok;result.error=not ok and tostring(err) or nil;result.elapsed=os.clock()-result.started
+    f.lastProbe=result
+    API.Stop("Auto Farm diagnostic finished")
+    if not ok then error(err) end
+    return result
+end
+function API.AutoFarmStatus()
+    local loose=0 for _,d in f.deferred do loose+=d.n end
+    return {running=f.running,phase=f.phase,message=f.message,error=f.error,needsAttention=f.needsAttention or false,
+        rows=f.plan and #f.plan.rows or 0,row=f.plan and f.plan.slots[f.cursor or 1] and f.plan.slots[f.cursor or 1].row,
+        batch=#f.manifest,cursor=f.cursor or 1,block=f.counts and f.counts[f.config.item] or 0,
+        seed=f.counts and f.counts[f.config.item+1] or 0,trees=f.totalTrees or 0,ripe=f.ripeTrees or 0,eta=f.eta or 0,
+        gems=f.gems or 0,loose=loose,placed=f.placed,broken=f.broken,planted=f.planted,harvested=f.harvested,
+        storageWarning=f.storageWarning,checkpointError=f.checkpointError}
+end
+end
+
 -- Use Alexandria's own SaveManager, matching the Hush integration.
 -- Runtime worker switches and per-world checkpoints are not configuration.
 local function setupConfigManager(manager, library, settingsTab)
@@ -2599,15 +3369,16 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.11 | Privacy aliases",
+        Footer = "v0.12 | Auto Farm",
         Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
     local clear = window:AddTab("Auto Clear", "ghost")
     local dirtTab = window:AddTab("Dirt Farm", "layers")
+    local farmTab = window:AddTab("Auto Farm", "sprout")
     local utilities = window:AddTab("Utilites", "zap")
     local cfg = window:AddTab("Settings", "settings")
-    S.uiTabs = {"Auto Clear", "Dirt Farm", "Utilites", "Settings"}
+    S.uiTabs = {"Auto Clear", "Dirt Farm", "Auto Farm", "Utilites", "Settings"}
     local function group(tab, side, name, icon)
         return tab:AddGroupbox({Side = side, Name = name, IconName = icon})
     end
@@ -2677,6 +3448,38 @@ local function buildUI()
     local dirtStats = group(dirtTab, "Right", "Tracking", "activity")
     S.dirtLabel = dirtStats:AddLabel("Preview before starting", true)
     local util = group(utilities, "Left", "Utilites", "zap")
+    local farmBox=group(farmTab,"Left","Auto Farm","sprout")
+    local labels,itemMap=API.AutoFarmItems()
+    local selectedLabel=DB[S.farm.config.item].name.." ["..S.farm.config.item.."]"
+    S.farmItemOption=farmBox:AddDropdown("GBFarmItem",{Text="Item",Values=labels,Default=selectedLabel,
+        Callback=function(value)
+            if S.farm.running then return end
+            local ok,err=pcall(API.ConfigureAutoFarm,itemMap[value],S.farm.config.harvestMode)
+            if not ok then S.farm.message=tostring(err) end
+        end})
+    S.farmHarvestOption=farmBox:AddDropdown("GBFarmHarvestMode",{Text="Harvest Mode",Values={"Bertahap","Tunggu Semua Matang"},Default="Bertahap",
+        Callback=function(value)
+            if S.farm.running then return end
+            local ok,err=pcall(API.ConfigureAutoFarm,S.farm.config.item,value)
+            if not ok then S.farm.message=tostring(err) end
+        end})
+    S.farmToggle=farmBox:AddToggle("GBAutoFarm",{Text="Auto Farm",Default=false,Callback=function(value)
+        if S.changingFarmToggle then return end
+        if not value then API.StopAutoFarm();return end
+        task.spawn(function()
+            local ok,err=pcall(API.StartAutoFarm)
+            if not ok then S.farm.message=tostring(err);requestToggle("farm",false) end
+        end)
+    end})
+    button(farmBox,"Preview",function() API.PreviewAutoFarm() end)
+    button(farmBox,"Load checkpoint",API.LoadAutoFarmCheckpoint)
+    button(farmBox,"Resume waiting",API.ResumeAutoFarm)
+    button(farmBox,"Validate solid / hazard item",function() API.ProbeAutoFarm("safety") end)
+    button(farmBox,"Refresh items",function()
+        assert(not S.farm.running,"Turn Auto Farm OFF first")
+        labels,itemMap=API.AutoFarmItems();S.farmItemOption:SetValues(labels)
+    end)
+    S.farmLabel=group(farmTab,"Right","Tracking","activity"):AddLabel("Preview before starting",true)
     util:AddToggle("GBHideName", {Text = "Hide Name", Default = true,
         Callback = function(value) API.SetHideName(value) end})
     util:AddToggle("GBHideWorldName", {Text = "Hide World Name", Default = true,
@@ -2711,6 +3514,15 @@ local function buildUI()
     task.spawn(function()
         while S.live do
             flushToggleRequests()
+            if S.farmLabel then pcall(function()
+                local a=API.AutoFarmStatus()
+                S.farmItemOption:SetDisabled(a.running);S.farmHarvestOption:SetDisabled(a.running)
+                local desired=DB[S.farm.config.item].name.." ["..S.farm.config.item.."]"
+                if S.farmItemOption.Value~=desired then S.farmItemOption:SetValue(desired) end
+                if S.farmHarvestOption.Value~=S.farm.config.harvestMode then S.farmHarvestOption:SetValue(S.farm.config.harvestMode) end
+                S.farmLabel:SetText(string.format("%s\nFloor %s/%d | Batch %d/%d\nBlock %d | Seed %d\nTrees %d/%d ripe | ETA %ds\nPlaced %d | Broken %d\nHarvest %d | Gems +%d\nLoose %d\n%s",a.message,
+                    tostring(a.row or "-"),a.rows,math.min(a.cursor,a.batch),a.batch,a.block,a.seed,a.ripe,a.trees,math.ceil(a.eta),a.placed,a.broken,a.harvested,a.gems,a.loose,a.storageWarning or a.checkpointError or "Storage: left seed / right block"))
+            end) end
             if S.dirtLabel then pcall(function()
                 local d, p = S.dirt, S.dirt.plan
                 S.dirtLabel:SetText(string.format("%s\nRow %s | x %s\nPlaced %d | Floors %d\nRemaining: Dirt %s | Platform %s\nStock: Dirt %s | Platform %s", d.phase,
