@@ -2737,6 +2737,12 @@ end
 function FarmCore.step(f, e)
     local id, seed = f.config.item, f.config.item + 1
     local function phase(name) f.phase = name; f.cursor = 1; f.waitReason=nil end
+    for k,entry in pairs(f.unresolved or {}) do
+        local tree=e.tree(entry.target)
+        if tree and tree.id==entry.id then f.trees[k]=entry.target;f.unresolved[k]=nil end
+    end
+    local unresolvedKey=next(f.unresolved or {})
+    f.verificationWarning=unresolvedKey and ("Unconfirmed tile "..unresolvedKey) or nil
     if f.phase == "prepare" then
         local counts = e.inventory()
         f.plan = e.scan(); assert(#f.plan.rows > 0 and #f.plan.slots > 0, "No accessible farm slots")
@@ -2756,6 +2762,7 @@ function FarmCore.step(f, e)
         if not t or f.remaining <= 0 then phase("break"); return end
         if not f.pending and e.canFill and not e.canFill(t) then phase("break");return end
         local k = FarmCore.key(t)
+        if not f.pending and f.unresolved and f.unresolved[k] then f.cursor=f.cursor+1;return end
         if not f.pending and e.tile(t) ~= 0 then f.cursor += 1; return end
         if not f.pending then
             local available = e.inventory()[id] or 0
@@ -2787,15 +2794,8 @@ function FarmCore.step(f, e)
             return
         end
         local t = f.plan.slots[f.cursor]
-        if not t then
-            for k,entry in pairs(f.unresolved or {}) do
-                local tree=e.tree(entry.target)
-                if tree and tree.id==entry.id then f.trees[k]=entry.target;f.unresolved[k]=nil end
-            end
-            local k=next(f.unresolved or {})
-            if k then f.waitReason="Verify planting at "..k;e.idle(2);return end
-            phase("wait"); return
-        end
+        if not t then phase("wait"); return end
+        if not f.pending and f.unresolved and f.unresolved[FarmCore.key(t)] then f.cursor=f.cursor+1;return end
         if not f.pending and e.tile(t) ~= 0 then f.cursor += 1; return end
         if not f.pending then
             local available = f.counts and f.counts[seed]
@@ -3957,7 +3957,7 @@ local function buildUI()
                 if S.farmItemOption.Value ~= item then S.farmItemOption:SetValue(item) end
                 if S.farmHarvestOption.Value ~= mode then S.farmHarvestOption:SetValue(mode) end
                 local action = S.farmUiStarting and "Starting" or UiText.farmAction(f)
-                S.farmLabel:SetText(UiText.panel(action, a.error or a.checkpointError or (f.waitReason and f.waitReason:find("Verify planting",1,true) and f.waitReason)) .. string.format(
+                S.farmLabel:SetText(UiText.panel(action, a.error or a.checkpointError or f.verificationWarning) .. string.format(
                     "\nFloor: %s/%d\nBatch: %d/%d\nBlocks: %d | Seeds: %d\nTrees: %d/%d ready\nETA: %ds\nPlaced: %d | Broken: %d\nHarvested: %d\nGems: +%d\nDrops: %d\nStorage: %s",
                     tostring(a.row or "-"), a.rows, math.min(a.cursor, a.batch), a.batch,
                     a.block, a.seed, a.ripe, a.trees, math.ceil(a.eta), a.placed, a.broken,
