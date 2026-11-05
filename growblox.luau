@@ -15,7 +15,7 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.5-spatial", live = true, running = false, busy = false,
+    version = "0.5.1-recovery", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil,
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
@@ -100,6 +100,8 @@ for i, v in debug.getupvalues(hit) do
     end
 end
 assert(world and controls and world.goTo, "Runtime layout changed; refusing to send")
+if previousProgress and previousProgress.engine == S.engine and previousProgress.world == world.name
+    and previousProgress.job == game.JobId then S.progress = previousProgress end
 local function position()
     -- Verified goTo upvalues 1/2 are the current tile-space player x/y.
     local x, y = debug.getupvalue(world.goTo, 1), debug.getupvalue(world.goTo, 2)
@@ -144,10 +146,12 @@ local inputService = game:GetService("UserInputService")
 local virtualInput = game:GetService("VirtualInputManager")
 local function inputKey(key, down)
     if S.movement.keys[key] == down then return end
+    restoreExecutorContext()
     virtualInput:SendKeyEvent(down, key, false, game)
     S.movement.keys[key] = down
 end
 local function releaseMovement()
+    restoreExecutorContext()
     for _, k in {Enum.KeyCode.A, Enum.KeyCode.D, Enum.KeyCode.Space} do
         pcall(function() virtualInput:SendKeyEvent(false, k, false, game) end)
         S.movement.keys[k] = false
@@ -170,7 +174,7 @@ function API.Stop(reason)
     S.busy = false
     if S.progress and not S.progress.complete then S.progress.state = "Paused"; S.progress.finishedAt = os.clock() end
     if API.SaveCheckpoint then API.SaveCheckpoint() end
-    status("Paused - Start / Resume continues from the live world")
+    status("Stopped: " .. S.lastStopReason)
     syncClearToggle(false)
 end
 function API.Unload()
@@ -308,9 +312,32 @@ function API.LoadCheckpoint()
     status("Checkpoint loaded - Start / Resume to continue")
     return {world = p.world, row = p.row, x = p.nextX, direction = p.direction}
 end
-local function active(generation)
+local function sessionAlive(generation)
     return S.live and S.running and S.generation == generation and world.name == S.boundWorld
-        and inputService:GetFocusedTextBox() == nil and not game.Players.LocalPlayer:GetAttribute("Frozen")
+end
+local function active(generation)
+    if not sessionAlive(generation) then return false end
+    -- Chat/UI focus and Frozen are temporary input gates, not end-of-run events.
+    local waiting = false
+    while inputService:GetFocusedTextBox() ~= nil or game.Players.LocalPlayer:GetAttribute("Frozen") do
+        if not sessionAlive(generation) then return false end
+        releaseMovement()
+        if not waiting then
+            waiting = true
+            if S.progress then S.progress.state = "Waiting" end
+            status("Waiting: close chat/menu or wait until unfrozen")
+        end
+        task.wait(0.15)
+    end
+    if waiting and S.progress then S.progress.state = "Running" end
+    return sessionAlive(generation)
+end
+local function recoverableFailure(reason)
+    local message = tostring(reason)
+    for _, fragment in {"landing", "land normally", "ground", "falling", "Corridor", "Route blocked", "movement stalled", "replan", "out of normal reach", "out of mining range"} do
+        if string.find(string.lower(message), string.lower(fragment), 1, true) then return true end
+    end
+    return false
 end
 local function supported(x, y)
     if not canStand(x, y) then return false end
@@ -1070,7 +1097,7 @@ function API.Start(region)
     S.running, S.busy, p.state = true, true, "Running"
     p.finishedAt = nil
     syncClearToggle(true)
-    p.lastError, S.lastStopReason = nil, nil
+    p.lastError = nil -- preserve the last stop reason for diagnosis after Resume
     S.worker = task.spawn(function()
         local run = {mode = "world-clear", protocol = "wire-layer-1-2", world = S.boundWorld,
             bounds = table.clone(p.bounds), targets = {}, started = os.clock()}
@@ -1087,8 +1114,23 @@ function API.Start(region)
                 end
                 local x, y = p.nextX, p.row
                 p.lastTarget = {x = x, y = y}
-                local cleared, why = clearCell(x, y, generation, run, p.edgePending)
-                if not cleared then error(why) end
+                local cleared, why
+                for attempt = 1, 4 do
+                    cleared, why = clearCell(x, y, generation, run, p.edgePending)
+                    if cleared then break end
+                    if not sessionAlive(generation) then return end
+                    if not recoverableFailure(why) or attempt == 4 then error(why) end
+                    releaseMovement()
+                    p.recoveries = (p.recoveries or 0) + 1
+                    p.lastRecovery = tostring(why)
+                    p.state = "Recovering"
+                    status(string.format("Recovering %d/3: %s", attempt, tostring(why)))
+                    -- Never punch or force position while falling; wait for real physics.
+                    waitGrounded(6, generation)
+                    if not active(generation) then return end
+                    task.wait(0.25 * attempt)
+                    p.state = "Running"
+                end
                 if p.edgePending then
                     -- Grounded pathfinding chooses a normal drop/jump at the corner; never force a descent.
                     p.edgePending = false
@@ -1135,7 +1177,11 @@ function API.Start(region)
         if not p.complete then p.state = ok and (p.unreachable > 0 and "Blocked" or "Paused") or "Blocked" end
         p.lastError = not ok and tostring(err) or nil
         checkpoint()
-        status(not ok and tostring(err) or reason or "Paused")
+        local gateReason = world.name ~= S.boundWorld and "World changed" or "Session interrupted"
+        local stopReason = not ok and (tostring(err):match("^[^\r\n]+") or tostring(err)) or reason or gateReason
+        S.lastStopReason, S.lastStopAt = stopReason, os.clock()
+        p.stopReason = stopReason
+        status((p.complete and "Complete: " or "Stopped: ") .. stopReason)
     end)
     return {world = p.world, bounds = p.bounds, row = p.row, x = p.nextX, direction = p.direction}
 end
@@ -1383,7 +1429,7 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.5 | Spatial navigation",
+        Footer = "v0.5.1 | Spatial navigation",
         Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
@@ -1418,7 +1464,7 @@ local function buildUI()
                     end
                     API.Start()
                 end, debug.traceback)
-                if not ok then status(tostring(err)); syncClearToggle(false) end
+                if not ok then S.lastStopReason = tostring(err):match("^[^\r\n]+") or tostring(err); status("Start failed: " .. S.lastStopReason); syncClearToggle(false) end
             end)
         end})
     local stats = group(clear, "Right", "Tracking", "activity")
