@@ -2744,8 +2744,10 @@ function FarmCore.step(f, e)
         if not t then phase("wait"); return end
         if not f.pending and e.tile(t) ~= 0 then f.cursor += 1; return end
         if not f.pending then
-            if (e.inventory()[seed] or 0) == 0 and not e.fetch(seed) then phase("wait"); return end
-            f.pending = {kind = "plant", target = t, id = seed, before = e.inventory()[seed] or 0}
+            local available = f.counts and f.counts[seed]
+            if available == nil then available = e.inventory()[seed] or 0 end
+            if available == 0 and not e.fetch(seed) then phase("wait"); return end
+            f.pending = {kind = "plant", target = t, id = seed, before = available}
             e.save()
         end
         assert(e.place(f.pending), "Waiting for planting acknowledgement; no blind resend")
@@ -3166,7 +3168,7 @@ local function stopFarmStride()
     f.strideGeneration=(f.strideGeneration or 0)+1
     releaseMovement()
 end
-local function beginFarmStride(t)
+local function beginFarmStride(t,kind)
     local def=DB[f.config.item]
     if not def or def.solid or def.hurts or (t.direction~=1 and t.direction~=-1) then return end
     local px,py=position()
@@ -3177,12 +3179,17 @@ local function beginFarmStride(t)
     f.strideGeneration=(f.strideGeneration or 0)+1
     local token=f.strideGeneration
     local direction=t.direction
+    f.strideDirection, f.strideFloor = direction, t.floor
     inputKey(direction==1 and Enum.KeyCode.D or Enum.KeyCode.A,true)
     task.spawn(function()
         local start=os.clock()
         while S.live and S.running and f.running and f.strideGeneration==token do
             local x,y=position()
-            if os.clock()-start>=0.22 or (x-px)*direction>=0.55 or math.abs(y-t.floor)>0.25 or not grounded()
+            local planting=kind=="plant"
+            if os.clock()-start >= (planting and 0.45 or 0.22)
+                or (x-px)*direction >= (planting and 0.8 or 0.55)
+                or (planting and (x-t.x-0.5)*direction>=0.05)
+                or math.abs(y-t.floor)>0.25 or not grounded()
                 or not passable(tile(0,nx,t.y)) then break end
             task.wait(0.015)
         end
@@ -3190,9 +3197,9 @@ local function beginFarmStride(t)
     end)
 end
 local function put(p)
-    stopFarmStride()
-    checkSession()
     local t=p.target
+    if p.kind~="plant" or f.strideDirection~=t.direction or f.strideFloor~=t.floor then stopFarmStride() end
+    checkSession()
     assert(tile(0,t.x,t.floor)==t.support,"Support changed; preserved")
     if not p.sent then
         assert(tile(0,t.x,t.y)==0,"Target occupied; no overwrite/splice")
@@ -3203,10 +3210,15 @@ local function put(p)
         assert(tile(0,t.x,t.y)==0 and not treeAt(t),"Target changed during movement")
         p.before=inventoryNow()[p.id] or 0
         assert(p.before>0,"No stock for placement")
+        local px,py=position()
+        if not grounded() or not accessible(t.x,t.y) or not inRange(t.x,t.y)
+            or (p.kind=="plant" and (math.abs(px-t.x-0.5)<0.95 or not canMineFrom(px,py,t.x,t.y))) then
+            stopFarmStride();return false
+        end
         p.sent=true;farmSave()
         f.lastPlaceSent=os.clock()
         nativeSetTile("fg",t.x,t.y,p.id)
-        if p.kind=="place" or p.kind=="plant" then beginFarmStride(t) end
+        if p.kind=="place" or p.kind=="plant" then beginFarmStride(t,p.kind) end
     end
     local deadline=os.clock()+0.9
     local pause=0.04
@@ -3373,7 +3385,7 @@ function API.StartAutoFarm(options)
                 end
                 FarmCore.step(f,env)
             end,debug.traceback)
-            releaseMovement()
+            if not ok or f.phase~="plant" then stopFarmStride() end
             if ok then failures=0;f.error=nil;f.message=f.waitReason or f.phase
             else
                 failures+=1;f.error=tostring(err);f.message="Waiting: "..tostring(err):match("^[^\r\n]+")
