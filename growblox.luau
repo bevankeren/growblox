@@ -1,4 +1,4 @@
--- Growblox workbench v0.4 | MANUAL CORRIDOR REWORK | native input only
+-- Growblox workbench v0.5 | SPATIAL CORRIDOR | native input only
 -- UI adapted from ../hush/UI_GUIDE.md and scripts/hush.luau.
 -- Starts idle. Never changes ItemDB or clears on load. Probe instrumentation is scoped/restored.
 local E = getgenv()
@@ -15,12 +15,12 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.4-corridor", live = true, running = false, busy = false,
+    version = "0.5-spatial", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil,
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
         verifyEvery = 20, alternative = "punch-burst"},
-    progress = nil, blocked = {}, engine = "manual-corridor-v1",
+    progress = nil, blocked = {}, engine = "spatial-corridor-v2",
     loot = previousLoot and previousLoot.job == game.JobId and previousLoot or {
         job = game.JobId, blocks = 0, seeds = 0, gems = 0, attempts = 0, denied = 0, fullItems = {}, retryAt = {}},
     movement = {mode = "native-input", validated = false, jumpValidated = false, keys = {},
@@ -129,7 +129,7 @@ end
 local function key(layer, x, y) return layer .. ":" .. x .. ":" .. y end
 local function status(message)
     S.status = message
-    if S.label then pcall(function() S.label:SetText(message) end) end
+    if S.label then pcall(function() S.label:SetText((tostring(message):match("^[^\r\n]+") or "Idle"):sub(1, 110)) end) end
 end
 
 -- ByteNet listen has no disposer; remove precisely our listener on Unload.
@@ -160,6 +160,7 @@ local function syncClearToggle(value)
     S.changingClearToggle = false
 end
 function API.Stop(reason)
+    S.cancelAutoStart = true
     S.lastStopReason = type(reason) == "string" and reason or "manual pause"
     S.lastStopAt = os.clock()
     S.running = false
@@ -167,7 +168,7 @@ function API.Stop(reason)
     releaseMovement()
     if S.worker then pcall(task.cancel, S.worker); S.worker = nil end
     S.busy = false
-    if S.progress and not S.progress.complete then S.progress.state = "Paused" end
+    if S.progress and not S.progress.complete then S.progress.state = "Paused"; S.progress.finishedAt = os.clock() end
     if API.SaveCheckpoint then API.SaveCheckpoint() end
     status("Paused - Start / Resume continues from the live world")
     syncClearToggle(false)
@@ -410,7 +411,16 @@ local function pathTo(x, y, exact)
     end
     if math.abs(px - (sx + 0.5)) > 0.16 then path[#path + 1] = {x = sx, y = sy, mode = "walk"} end
     for i = #reversed - 1, 1, -1 do path[#path + 1] = reversed[i] end
-    return path
+    local compact = {}
+    for _, node in path do
+        local prev, before = compact[#compact], compact[#compact - 1]
+        if prev and before and node.mode == "walk" and prev.mode == "walk"
+            and before.y == prev.y and node.y == prev.y
+            and (node.x - prev.x) * (prev.x - before.x) > 0 then
+            compact[#compact] = node
+        else compact[#compact + 1] = node end
+    end
+    return compact
 end
 function API.PlanRoute(x, y, exact)
     return pathTo(x, y, exact == true)
@@ -425,16 +435,22 @@ local function follow(path, generation)
         local began = os.clock()
         if n.mode == "jump" then inputKey(Enum.KeyCode.Space, true) end
         local arrived = false
+        local lastX, lastY, lastProgress = fromX, fromY, os.clock()
         repeat
             if not active(generation) then releaseMovement(); return false, "Paused" end
             local px, py = position()
             local dx = gx - px
+            if math.abs(px - lastX) + math.abs(py - lastY) > 0.06 then
+                lastX, lastY, lastProgress = px, py, os.clock()
+            elseif os.clock() - lastProgress > 1.2 then
+                releaseMovement(); return false, "Route blocked: no physical progress"
+            end
             inputKey(Enum.KeyCode.A, dx < -0.16)
             inputKey(Enum.KeyCode.D, dx > 0.16)
             if os.clock() - began > 0.08 then inputKey(Enum.KeyCode.Space, false) end
             if math.abs(dx) <= 0.18 and math.abs(py - gy) <= 0.2 and grounded() then arrived = true; break end
             task.wait(0.04)
-        until os.clock() - began > math.max(3, 1.5 + math.sqrt(math.max(0, gy - fromY)) * 0.6)
+        until os.clock() - began > math.max(3, 2 + math.abs(gx - fromX) / 2 + math.sqrt(math.max(0, gy - fromY)) * 0.6)
         releaseMovement()
         if not arrived then return false, "Normal-input movement stalled; paused without forcing position" end
         task.wait(0.14)
@@ -465,9 +481,36 @@ local function follow(path, generation)
 end
 -- Manual-demo engine: work from the cleared corridor, never pre-position ABOVE
 -- every target. General graph search is reserved for entry and obstacle detours.
+local function rowFrontier(y, bounds)
+    local first, last
+    for x = bounds.x0, bounds.x1 do
+        if eligible(0, x, y) or eligible(1, x, y) then
+            first = first or x; last = x
+        end
+    end
+    if not first then return nil end
+    local px = position()
+    if math.abs(px - (first + 0.5)) <= math.abs(px - (last + 0.5)) then return first, 1 end
+    return last, -1
+end
+function API.SpatialPlan(y, bounds)
+    local b = bounds or (S.progress and S.progress.bounds) or {x0 = 0, x1 = world.w - 1, y0 = 1, y1 = world.h - 1}
+    local x, direction = rowFrontier(y, b)
+    if not x then return {empty = true, row = y} end
+    local path, err = pathTo(x, y, false)
+    return {row = y, x = x, direction = direction, waypoints = path and #path,
+        first = path and path[1], last = path and path[#path], error = err}
+end
+local function enterRow(p)
+    local x, direction = rowFrontier(p.row, p.bounds)
+    p.entryX = x
+    if x then p.nextX, p.direction = x, direction end
+    p.rowEntered = true
+    return x ~= nil
+end
 local function safeCornerDescent(x, y)
     local p = S.progress
-    if not p or (x ~= p.bounds.x0 and x ~= p.bounds.x1) then return false end
+    if not p or (x ~= p.bounds.x0 and x ~= p.bounds.x1 and x ~= p.entryX) then return false end
     local px, py = position()
     if math.floor(px) ~= x or math.floor(py - 0.02) + 1 ~= y then return false end
     local below = DB[tile(0, x, y + 1) or 0]
@@ -728,7 +771,16 @@ local function clearCell(x, y, generation, run, stay)
     -- No per-cell graph search, center alignment loop, or fixed pickup sleep.
     if supported(x, y) then
         S.progress.phase = "advance-corridor"
-        local moved, why = corridorStep(x, y, generation)
+        local px, py = position()
+        local moved, why
+        if math.abs(py - (y + 0.999)) <= 0.25 and math.abs(px - x - 0.5) <= 1.6 then
+            moved, why = corridorStep(x, y, generation)
+        else
+            -- Newly opened cell can be one level below us: normal drop path,
+            -- NOT a horizontal corridor command issued at the wrong height.
+            local path, err = pathTo(x, y, true)
+            if path then moved, why = follow(path, generation) else why = err end
+        end
         if not moved then return false, why end
     end
     collectNearby(false)
@@ -1002,7 +1054,7 @@ function API.Start(region)
     if region or not p or p.movementMode ~= "native-input" or p.engine ~= S.engine or p.world ~= world.name or p.job ~= game.JobId or not p.bounds or p.complete then
         local plan = API.Preview(region)
         p = {world = world.name, job = game.JobId, movementMode = "native-input", engine = S.engine, bounds = table.clone(plan.bounds),
-            row = plan.bounds.y0, nextX = plan.bounds.x0, direction = 1, edgePending = false,
+            row = plan.bounds.y0, nextX = plan.bounds.x0, direction = 1, edgePending = false, rowEntered = false, startedAt = os.clock(),
             moves = 0, distance = 0, detours = 0, hits = 0, cells = 0, foreground = 0, background = 0,
             protected = 0, unreachable = 0, serverCleared = 0, serverRejected = 0, verifications = 0, turns = 0,
             turnLog = {}, initial = plan.counts.total, complete = false}
@@ -1016,6 +1068,7 @@ function API.Start(region)
     S.generation = (S.generation or 0) + 1
     local generation = S.generation
     S.running, S.busy, p.state = true, true, "Running"
+    p.finishedAt = nil
     syncClearToggle(true)
     p.lastError, S.lastStopReason = nil, nil
     S.worker = task.spawn(function()
@@ -1025,6 +1078,13 @@ function API.Start(region)
         local checked, reason, rejectedAtStart = 0, nil, p.serverRejected
         local ok, err = xpcall(function()
             while active(generation) and p.row <= p.bounds.y1 do
+                if not p.rowEntered then
+                    -- Fast-forward empty rows without sending any movement input.
+                    while p.row <= p.bounds.y1 and not enterRow(p) do
+                        p.row += 1; p.rowEntered = false
+                    end
+                    if p.row > p.bounds.y1 then break end
+                end
                 local x, y = p.nextX, p.row
                 p.lastTarget = {x = x, y = y}
                 local cleared, why = clearCell(x, y, generation, run, p.edgePending)
@@ -1042,7 +1102,7 @@ function API.Start(region)
                     if p.serverRejected > rejectedAtStart then error("Server rejected a removal; paused rather than retry flooding") end
                 end
                 if edge then
-                    p.row += 1; p.direction = -p.direction
+                    p.row += 1; p.direction = -p.direction; p.rowEntered = false
                     p.nextX = p.direction == 1 and p.bounds.x0 or p.bounds.x1
                     p.edgePending = true
                     if p.row <= p.bounds.y1 then
@@ -1070,6 +1130,7 @@ function API.Start(region)
         S.running, S.busy, S.worker = false, false, nil
         syncClearToggle(false)
         releaseMovement()
+        p.finishedAt = os.clock()
         run.ok, run.error, run.elapsed = ok, not ok and tostring(err) or nil, os.clock() - run.started
         if not p.complete then p.state = ok and (p.unreachable > 0 and "Blocked" or "Paused") or "Blocked" end
         p.lastError = not ok and tostring(err) or nil
@@ -1322,14 +1383,13 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.4 | Manual corridor engine | Native input",
-        Badge = "HALLOWEEN", Size = UDim2.fromOffset(720, 540), Center = true, AutoShow = true,
+        Footer = "v0.5 | Spatial navigation",
+        Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
     local clear = window:AddTab("Auto Clear", "ghost")
-    local recipes = window:AddTab("Recipes & Mass", "candy")
-    local lab = window:AddTab("Status", "activity")
-    local cfg = window:AddTab("Settings", "moon")
+    local cfg = window:AddTab("Settings", "settings")
+    S.uiTabs = {"Auto Clear", "Settings"}
     local function group(tab, side, name, icon)
         return tab:AddGroupbox({Side = side, Name = name, IconName = icon})
     end
@@ -1342,59 +1402,57 @@ local function buildUI()
         end
         return box:AddButton({Text = text, Func = wrapped, Callback = wrapped})
     end
-    local box = group(clear, "Left", "Haunted Grounds | Corridor Rework", "ghost")
-    box:AddLabel("NEW: demo-based corridor engine.\nLeft > right > down > left, repeat.\nForeground + cave background.\nLocks, obsidian, bedrock and doors stay intact.")
-    box:AddLabel("Movement: normal A/D + Space only.\nNo hovering, teleport or custom speed.")
-    box:AddSlider("GBHitInterval", {Text = "Normal hit interval", Min = 0.24, Max = 1, Default = 0.24, Rounding = 2,
-        Callback = function(v) S.config.interval = v end})
-    S.limitOption = box:AddSlider("GBLimit", {Text = "Run limit (0 = all)", Min = 0, Max = 5000, Default = 0, Rounding = 0,
-        Callback = function(v) S.config.limit = v end})
-    button(box, "1. Test normal walk + jump (required)", API.CalibrateGrounded)
-    button(box, "2. Preview world", function() API.Preview() end)
+    local box = group(clear, "Left", "Auto Clear", "ghost")
     S.clearToggle = box:AddToggle("GBAutoClearWorld", {Text = "Auto Clear World", Default = false,
         Callback = function(enabled)
             if S.changingClearToggle then return end
             if not enabled then API.Stop("autoclear toggle OFF"); return end
+            S.cancelAutoStart = false
             task.spawn(function()
-                local ok, err = xpcall(function() API.Start() end, debug.traceback)
+                local ok, err = xpcall(function()
+                    if not S.movement.validated or S.movement.world ~= world.name or S.movement.job ~= game.JobId then
+                        local test = API.CalibrateGrounded()
+                        assert(test.ok, test.error or "Calibration failed")
+                        -- OFF pressed during calibration must cancel pending start.
+                        if S.cancelAutoStart then return end
+                    end
+                    API.Start()
+                end, debug.traceback)
                 if not ok then status(tostring(err)); syncClearToggle(false) end
             end)
         end})
-    button(box, "Load saved checkpoint", API.LoadCheckpoint)
-    local session = group(clear, "Right", "Witching Hour", "moon")
-    session:AddLabel("HALLOWEEN // PURPLE + MAGENTA\nNatural blocks only. No auto-start.")
-    S.label = session:AddLabel(S.status)
-    S.lootLabel = session:AddLabel("Auto pickup: block, seed, gems\nFull stack: continue; report leftovers.")
-    local recipeBox = group(recipes, "Left", "Database", "database")
-    recipeBox:AddLabel("804 base recipes + fallback + random sets")
-    local recipeLabel = recipeBox:AddLabel("Sugar Cane Seed (955):\nSeaweed Seed (847) + Happy Joy Plaque Seed (581)")
-    recipeBox:AddInput("GBRecipeID", {Text = "Result seed ID", Default = "955", Numeric = true,
-        Finished = true, Callback = function(value)
-            local r = API.Recipe(value)
-            local lines = {tostring(r.name or "Unknown ID") .. " (" .. tostring(r.id) .. ")"}
-            for _, pair in r.recipes do lines[#lines + 1] = pair.aName .. " + " .. pair.bName .. (pair.randomSet and " (random set)" or "") end
-            recipeLabel:SetText(table.concat(lines, "\n"))
-        end})
-    button(recipeBox, "Export 804 recipes (executor workspace)", function() API.ExportRecipes(); status("Exported growblox-recipes.tsv") end)
-    local mass = group(recipes, "Right", "Mass Planner - not automated", "sprout")
-    mass:AddLabel("Sugar Cane: 2 hits, farmable, spread 3.\nGrow: 8726 sec (2h 25m 26s).\nRecipe > grow > harvest > place > break > collect.\nYield/seed-return ratio not measured.")
-    local research = group(lab, "Left", "Clear verification", "activity")
-    research:AddLabel("Experimental punch features are paused.\nLive grid pathfinding + normal mining.\nForeground and background checked on server.")
-    button(research, "Record my manual farming", API.StartRecording)
-    button(research, "Stop / save demonstration", function() API.StopRecording("user") end)
-    button(research, "Inspect progress", function()
-        local p = S.progress
-        status(p and string.format("%s | row %d x %d\nFG %d BG %d | turns %d\nMoves %d | detours %d\nServer cleared %d", p.state, p.row, p.nextX,
-            p.foreground, p.background, p.turns, p.moves, p.detours, p.serverCleared) or "No clear session yet")
+    local stats = group(clear, "Right", "Tracking", "activity")
+    S.label = stats:AddLabel("Idle", true)
+    S.trackingLabel = stats:AddLabel("FG 0 | BG 0\nCells 0 | Moves 0\nTime 00:00 | Rate 0/min", true)
+    S.lootLabel = stats:AddLabel("Block 0 | Seed 0 | Gems 0", true)
+    local settings = group(cfg, "Left", "Clear", "settings")
+    settings:AddSlider("GBHitInterval", {Text = "Hit interval", Min = 0.24, Max = 1, Default = 0.24, Rounding = 2,
+        Callback = function(v) S.config.interval = v end})
+    settings:AddToggle("GBAutoPickup", {Text = "Pickup drops", Default = true,
+        Callback = function(v) S.config.autoPickup = v end})
+    settings:AddToggle("GBPauseFocus", {Text = "Pause on focus loss", Default = false,
+        Callback = function(v) S.config.pauseOnFocusLoss = v end})
+    S.limitOption = settings:AddSlider("GBLimit", {Text = "Tile limit (0 = all)", Min = 0, Max = 5000, Default = 0, Rounding = 0,
+        Callback = function(v) S.config.limit = v end})
+    button(settings, "Calibrate movement", API.CalibrateGrounded)
+    button(settings, "Load checkpoint", API.LoadCheckpoint)
+    local session = group(cfg, "Right", "Session", "moon")
+    session:AddLabel("RightShift: menu | End: stop")
+    button(session, "Unload", API.Unload)
+    task.spawn(function()
+        while S.live do
+            local p = S.progress
+            local elapsed = p and math.max(0, (p.finishedAt or os.clock()) - (p.startedAt or os.clock())) or 0
+            local cells = p and p.cells or 0
+            pcall(function()
+                S.trackingLabel:SetText(string.format("FG %d | BG %d\nCells %d | Moves %d\nTime %02d:%02d | Rate %.1f/min\nRow %s | Target %s | Detours %d", p and p.foreground or 0,
+                    p and p.background or 0, cells, p and p.moves or 0, math.floor(elapsed / 60), math.floor(elapsed % 60),
+                    elapsed > 0 and cells * 60 / elapsed or 0, p and tostring(p.row) or "-", p and tostring(p.nextX) or "-", p and p.detours or 0))
+            end)
+            task.wait(0.5)
+        end
     end)
-    button(research, "Verify world (returns to spawn)", function()
-        local ok = API.VerifyServerWorld(world.name)
-        status(ok and ("Server snapshot checked: " .. S.confirmed .. " persisted removals") or "Server snapshot unavailable")
-    end)
-    group(lab, "Right", "Scope", "info"):AddLabel("Client-visible modules and live state only.\nNo server script/database access.\nNo admin calls or persistent gameplay hooks.")
-    local settings = group(cfg, "Left", "Session", "settings")
-    settings:AddLabel("RightShift: toggle menu. End: emergency stop.\nNo auto-start or saved automation flags.")
-    button(settings, "Unload", API.Unload)
+
 end
 S.connections[#S.connections + 1] = game:GetService("UserInputService").InputBegan:Connect(function(input)
     if input.KeyCode == Enum.KeyCode.End then API.Stop() end
