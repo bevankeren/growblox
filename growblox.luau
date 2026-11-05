@@ -15,11 +15,13 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.5.1-recovery", live = true, running = false, busy = false,
+    version = "0.6-utilities", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil,
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
         verifyEvery = 20, alternative = "punch-burst"},
+    utilities = {ultraFPS = false, leaveStaff = false, leaveCount = false, maxPeople = 3, present = {}, hooks = {}, fpsSaved = {}, fpsConnections = {}, leaving = false},
+    mining = {effectiveInterval = 0.24, timeouts = 0, backoffs = 0},
     progress = nil, blocked = {}, engine = "spatial-corridor-v2",
     loot = previousLoot and previousLoot.job == game.JobId and previousLoot or {
         job = game.JobId, blocks = 0, seeds = 0, gems = 0, attempts = 0, denied = 0, fullItems = {}, retryAt = {}},
@@ -178,6 +180,7 @@ function API.Stop(reason)
     syncClearToggle(false)
 end
 function API.Unload()
+    if API.CleanupUtilities then API.CleanupUtilities() end
     if API.StopRecording then API.StopRecording("script unload") end
     API.Stop("script reload/unload")
     S.live = false
@@ -334,7 +337,7 @@ local function active(generation)
 end
 local function recoverableFailure(reason)
     local message = tostring(reason)
-    for _, fragment in {"landing", "land normally", "ground", "falling", "Corridor", "Route blocked", "movement stalled", "replan", "out of normal reach", "out of mining range"} do
+    for _, fragment in {"landing", "land normally", "ground", "falling", "Corridor", "Route blocked", "movement stalled", "replan", "out of normal reach", "out of mining range", "Mining timeout"} do
         if string.find(string.lower(message), string.lower(fragment), 1, true) then return true end
     end
     return false
@@ -748,7 +751,8 @@ local function mineLayer(x, y, layer, generation, run)
     local id, needed = tile(layer, x, y), DB[tile(layer, x, y)].hits
     local px, py = position()
     if not canMineFrom(px, py, x, y) then return false, "Target out of mining range" end
-    for _ = 1, needed + 1 do
+    local maxCalls = needed * 3 + 3
+    for attempt = 1, maxCalls do
         if not active(generation) then return false, "Paused" end
         if tile(layer, x, y) ~= id then break end
         if not accessible(x, y) then return false, "Build permission changed" end
@@ -761,14 +765,23 @@ local function mineLayer(x, y, layer, generation, run)
         hit(x, y)
         S.nativeCalls += 1; S.progress.hits += 1
         if tile(layer, x, y) == 0 then break end
-        task.wait(math.max(0.24, S.config.interval))
+        if attempt >= needed + 1 then
+            -- An invocation is not proof of an accepted hit. Back off normally;
+            -- never reset the native cooldown or manufacture extra hit packets.
+            S.mining.effectiveInterval = math.min(0.6, math.max(0.35, S.mining.effectiveInterval + 0.05))
+            S.mining.backoffs += 1
+        end
+        task.wait(math.max(0.24, S.config.interval, S.mining.effectiveInterval))
     end
-    if tile(layer, x, y) ~= 0 then return false, "Normal mining did not remove target" end
+    if tile(layer, x, y) ~= 0 then
+        S.mining.timeouts += 1
+        return false, "Mining timeout: tile still present after normal paced hits"
+    end
     local t = {x = x, y = y, layer = layer, before = id, after = 0}
     run.targets[#run.targets + 1] = t
     if layer == 0 then S.progress.foreground += 1 else S.progress.background += 1 end
     S.localCleared += 1
-    task.wait(math.max(0.24, S.config.interval)) -- native cadence, not a cooldown bypass
+    task.wait(math.max(0.35, S.config.interval, S.mining.effectiveInterval)) -- native cadence, not a cooldown bypass
     if not waitGrounded(2, generation) then return false, "Corner descent did not land normally" end
     t.afterSettled = tile(layer, x, y)
     if t.afterSettled ~= 0 then return false, "Tile was corrected after normal mining" end
@@ -1391,6 +1404,185 @@ function API.ExportRecipes()
     return {file = "growblox-recipes.tsv", rows = #Recipes}
 end
 
+-- Utilities are presentation-only or use the game's ordinary LeaveWorld call.
+-- No game scripts, grids, input controls or pickup records are destroyed.
+local Roles = require(RS.Shared.Roles)
+local othersSource = "Players." .. game.Players.LocalPlayer.Name .. ".PlayerGui.GameGui.Others"
+local nativeLeave
+for _, f in filtergc("function", {Constants = {"LeaveWorld", "reset"}}, false) do
+    if debug.info(f, "s") == gameSource then nativeLeave = f; break end
+end
+local peerRegistry
+for _, listener in Net.entered.getListeners() do
+    if debug.info(listener, "s") == othersSource then
+        local candidate = debug.getupvalue(listener, 1)
+        if type(candidate) == "table" then peerRegistry = candidate; break end
+    end
+end
+local function staffUser(userId)
+    if type(userId) ~= "number" then return false end
+    local roles = RS:FindFirstChild("StaffRoles")
+    local role = roles and roles:GetAttribute("u" .. tostring(userId))
+    if role == "admin" or role == "administrator" or role == "owner" then return true end
+    local ok, staff = pcall(Roles.isStaff, userId)
+    return ok and staff == true
+end
+local function utilityDecision(options, roster, selfId)
+    if options.leaveStaff then
+        for _, person in roster do
+            if person.userId ~= selfId and person.staff then return "Staff detected", person.userId end
+        end
+    end
+    if options.leaveCount and #roster >= options.maxPeople then return "Player limit reached", #roster end
+    return nil
+end
+local function utilityRoster()
+    local u = S.utilities
+    local roster, seen = {}, {}
+    local selfId = game.Players.LocalPlayer.UserId
+    if not world.name or world.name == "" then return roster end
+    roster[1], seen[selfId] = {userId = selfId, staff = false}, true
+    if type(peerRegistry) ~= "table" then return nil, "World roster unavailable" end
+    for id, entry in peerRegistry do
+        local remembered = u.present[id]
+        local who = type(entry) == "table" and entry.who or nil
+        local uid = remembered and remembered.userId
+            or (type(entry) == "table" and entry.userId)
+            or (type(who) == "table" and who.userId)
+            or (type(who) == "number" and who)
+        local key = uid or ("peer:" .. tostring(id))
+        if not seen[key] then
+            seen[key] = true
+            roster[#roster + 1] = {userId = uid, staff = staffUser(uid), peerId = id}
+        end
+    end
+    return roster
+end
+function API.UtilityStatus()
+    local roster, err = utilityRoster()
+    local u = S.utilities
+    return {ultraFPS = u.ultraFPS, leaveStaff = u.leaveStaff, leaveCount = u.leaveCount,
+        maxPeople = u.maxPeople, people = roster and #roster, rosterError = err,
+        leaving = u.leaving, leaveReady = nativeLeave ~= nil, lastLeave = u.lastLeave, lastError = u.lastError}
+end
+function API.CheckUtilities(dryRun)
+    local u = S.utilities
+    local roster, err = utilityRoster()
+    if not roster then u.lastError = err; return nil, err end
+    local reason, detail = utilityDecision(u, roster, game.Players.LocalPlayer.UserId)
+    if dryRun or not reason or u.leaving then return reason, detail end
+    u.leaving, u.lastLeave = true, reason .. ": " .. tostring(detail)
+    -- Stop keys/worker BEFORE sending the game's normal leave request, once.
+    API.Stop(u.lastLeave)
+    local ok, failure = pcall(function()
+        assert(nativeLeave, "Native leave handler unavailable; reload before enabling auto leave")
+        nativeLeave() -- same LeaveWorld + local reset path as the normal game menu
+    end)
+    restoreExecutorContext()
+    if not ok then
+        u.leaving, u.lastError = false, tostring(failure)
+        status("Leave failed: " .. tostring(failure))
+        return nil, failure
+    end
+    status("Leaving world: " .. u.lastLeave)
+    return reason, detail
+end
+local function utilityListen(packet, callback)
+    packet.listen(callback)
+    S.utilities.hooks[#S.utilities.hooks + 1] = {packet = packet, callback = callback}
+end
+utilityListen(Net.entered, function(packet)
+    if type(packet) ~= "table" then return end
+    S.utilities.present[packet.id] = {userId = packet.userId, name = packet.name}
+    task.defer(function() if S.live then API.CheckUtilities(false) end end)
+end)
+utilityListen(Net.left, function(id) S.utilities.present[id] = nil end)
+local function fpsSet(object, property, value)
+    local u = S.utilities
+    local saved = u.fpsSaved[object]
+    if not saved then saved = {}; u.fpsSaved[object] = saved end
+    local ok, old = pcall(function() return object[property] end)
+    if ok then
+        if saved[property] == nil then saved[property] = {value = old} end
+        pcall(function() object[property] = value end)
+    end
+end
+function API.SetUltraFPS(enabled)
+    local u = S.utilities
+    enabled = enabled == true
+    if u.ultraFPS == enabled then return end
+    u.ultraFPS = enabled
+    if enabled then
+        local gui = game.Players.LocalPlayer.PlayerGui:FindFirstChild("GameGui")
+        local function hideLayer(layer)
+            if not layer:IsA("GuiObject") or (layer.Name ~= "World" and layer.Name ~= "WorldFxLayer") then return end
+            fpsSet(layer, "Visible", false)
+            u.fpsConnections[#u.fpsConnections + 1] = layer:GetPropertyChangedSignal("Visible"):Connect(function()
+                if u.ultraFPS and layer.Visible then layer.Visible = false end
+            end)
+        end
+        if gui then
+            for _, layer in gui:GetChildren() do hideLayer(layer) end
+            u.fpsConnections[#u.fpsConnections + 1] = gui.ChildAdded:Connect(hideLayer)
+        end
+        local lighting = game:GetService("Lighting")
+        fpsSet(lighting, "GlobalShadows", false)
+        for _, effect in lighting:QueryDescendants("PostEffect") do fpsSet(effect, "Enabled", false) end
+        local ok, quality = pcall(function() return UserSettings():GetService("UserGameSettings") end)
+        if ok then fpsSet(quality, "SavedQualityLevel", Enum.SavedQualitySetting.QualityLevel1) end
+        local rs = game:GetService("RunService")
+        local readOK, rendering = pcall(function() return rs:Is3dRenderingEnabled() end)
+        if readOK then
+            u.oldRendering = rendering
+            pcall(function() rs:Set3dRenderingEnabled(false) end)
+        end
+        if type(getfpscap) == "function" and type(setfpscap) == "function" then
+            local capOK, cap = pcall(getfpscap)
+            if capOK then u.oldFPSCap = cap; pcall(setfpscap, 0) end
+        end
+    else
+        for _, connection in u.fpsConnections do connection:Disconnect() end
+        table.clear(u.fpsConnections)
+        for object, properties in u.fpsSaved do
+            for property, original in properties do pcall(function()
+                if property == "Visible" and u.leaving then object[property] = false else object[property] = original.value end
+            end) end
+        end
+        table.clear(u.fpsSaved)
+        if u.oldRendering ~= nil then pcall(function() game:GetService("RunService"):Set3dRenderingEnabled(u.oldRendering) end); u.oldRendering = nil end
+        if u.oldFPSCap ~= nil then pcall(setfpscap, u.oldFPSCap); u.oldFPSCap = nil end
+    end
+end
+function API.CleanupUtilities()
+    API.SetUltraFPS(false)
+    for _, hook in S.utilities.hooks do
+        local listeners = hook.packet.getListeners()
+        local i = table.find(listeners, hook.callback)
+        if i then table.remove(listeners, i) end
+    end
+    table.clear(S.utilities.hooks)
+end
+task.spawn(function()
+    local previousWorld = world.name
+    while S.live do
+        if previousWorld ~= world.name then
+            previousWorld = world.name
+            table.clear(S.utilities.present)
+            S.utilities.leaving = false
+        end
+        if S.utilities.leaveStaff or S.utilities.leaveCount then
+            local ok, err = pcall(API.CheckUtilities, false)
+            if not ok then S.utilities.lastError = tostring(err) end
+        end
+        if S.utilityLabel then
+            local u = API.UtilityStatus()
+            pcall(function() S.utilityLabel:SetText(string.format("World: %s | People: %s\n%s", tostring(world.name or "-"),
+                tostring(u.people or "?"), u.lastError or u.lastLeave or "Ready")) end)
+        end
+        task.wait(0.5)
+    end
+end)
+
 -- Same Alexandria initialization, tab/groupbox styling and button compatibility as Hush.
 local function buildUI()
     local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/Alexandria/main/Library.lua"))()
@@ -1429,13 +1621,14 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.5.1 | Spatial navigation",
+        Footer = "v0.6 | Utilities + paced mining",
         Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
     local clear = window:AddTab("Auto Clear", "ghost")
+    local utilities = window:AddTab("Utilites", "zap")
     local cfg = window:AddTab("Settings", "settings")
-    S.uiTabs = {"Auto Clear", "Settings"}
+    S.uiTabs = {"Auto Clear", "Utilites", "Settings"}
     local function group(tab, side, name, icon)
         return tab:AddGroupbox({Side = side, Name = name, IconName = icon})
     end
@@ -1471,6 +1664,18 @@ local function buildUI()
     S.label = stats:AddLabel("Idle", true)
     S.trackingLabel = stats:AddLabel("FG 0 | BG 0\nCells 0 | Moves 0\nTime 00:00 | Rate 0/min", true)
     S.lootLabel = stats:AddLabel("Block 0 | Seed 0 | Gems 0", true)
+    local util = group(utilities, "Left", "Utilites", "zap")
+    util:AddToggle("GBUltraFPS", {Text = "Ultra FPS booster", Default = false,
+        Callback = function(value) API.SetUltraFPS(value) end})
+    util:AddToggle("GBLeaveStaff", {Text = "Auto leave on Mods/Admin", Default = false,
+        Callback = function(value) S.utilities.leaveStaff = value end})
+    util:AddToggle("GBLeaveCount", {Text = "Auto leave at X people", Default = false,
+        Callback = function(value) S.utilities.leaveCount = value end})
+    util:AddSlider("GBMaxPeople", {Text = "People limit (includes you)", Min = 1, Max = 100, Default = 3, Rounding = 0,
+        Callback = function(value) S.utilities.maxPeople = math.max(1, math.floor(value)) end})
+    local utilStatus = group(utilities, "Right", "Status", "activity")
+    utilStatus:AddLabel("Ultra FPS hides the world. Script and pickups stay active.", true)
+    S.utilityLabel = utilStatus:AddLabel("Ready", true)
     local settings = group(cfg, "Left", "Clear", "settings")
     settings:AddSlider("GBHitInterval", {Text = "Hit interval", Min = 0.24, Max = 1, Default = 0.24, Rounding = 2,
         Callback = function(v) S.config.interval = v end})
