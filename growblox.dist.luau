@@ -3155,7 +3155,35 @@ local function scan()
     end
     return p
 end
+local function stopFarmStride()
+    f.strideGeneration=(f.strideGeneration or 0)+1
+    releaseMovement()
+end
+local function beginFarmStride(t)
+    local def=DB[f.config.item]
+    if not def or def.solid or def.hurts or (t.direction~=1 and t.direction~=-1) then return end
+    local px,py=position()
+    local nx=math.floor(px)+t.direction
+    if nx<1 or nx>world.w-2 or math.abs(py-t.floor)>0.25 or not grounded() then return end
+    local support=DB[tile(0,nx,t.floor) or 0]
+    if not support or support.hurts or not (support.solid or support.platform) or not passable(tile(0,nx,t.y)) then return end
+    f.strideGeneration=(f.strideGeneration or 0)+1
+    local token=f.strideGeneration
+    local direction=t.direction
+    inputKey(direction==1 and Enum.KeyCode.D or Enum.KeyCode.A,true)
+    task.spawn(function()
+        local start=os.clock()
+        while S.live and S.running and f.running and f.strideGeneration==token do
+            local x,y=position()
+            if os.clock()-start>=0.22 or (x-px)*direction>=0.55 or math.abs(y-t.floor)>0.25 or not grounded()
+                or not passable(tile(0,nx,t.y)) then break end
+            task.wait(0.015)
+        end
+        if f.strideGeneration==token then releaseMovement() end
+    end)
+end
 local function put(p)
+    stopFarmStride()
     checkSession()
     local t=p.target
     assert(tile(0,t.x,t.floor)==t.support,"Support changed; preserved")
@@ -3171,6 +3199,7 @@ local function put(p)
         p.sent=true;farmSave()
         f.lastPlaceSent=os.clock()
         nativeSetTile("fg",t.x,t.y,p.id)
+        if p.kind=="place" then beginFarmStride(t) end
     end
     local deadline=os.clock()+0.9
     local pause=0.04
@@ -3185,9 +3214,11 @@ local function put(p)
         task.wait(math.min(pause,deadline-os.clock()))
         pause=math.min(0.16,pause*2)
     until false
+    stopFarmStride()
     return false
 end
 local function remove(t,harvest)
+    stopFarmStride()
     checkSession()
     local expected=harvest and f.config.item+1 or f.config.item
     if tile(0,t.x,t.y)==0 and not treeAt(t) then return true end
