@@ -97,9 +97,16 @@ do
 end
 local RS = game:GetService("ReplicatedStorage")
 assert(game.PlaceId == 112863874972771, "Growblox client required")
+local managerLoader
+pcall(function()
+    local source=game:HttpGet("https://raw.githubusercontent.com/joustingmatch/Alexandria/main/addons/SaveManager.lua")
+    managerLoader=loadstring(source)
+end)
 local Net = require(RS.Shared.Net)
 local DB = require(RS.Shared.ItemDB)
-local Recipes = require(RS.Shared.Splice.Recipes)
+local recipeModule = RS.Shared.Splice:FindFirstChild("SpliceRecipes") or RS.Shared.Splice:FindFirstChild("Recipes")
+assert(recipeModule, "Splice recipe module unavailable")
+local Recipes = require(recipeModule)
 local Splice = require(RS.Shared.Splice)
 local S = {
     version = "1.0", live = true, running = false, busy = false,
@@ -3763,8 +3770,8 @@ local function buildUI()
     S.dirtLabel = dirtStats:AddLabel(UiText.panel("Idle"), true)
     local util = group(utilities, "Left", "Utilities", "zap")
     local farmBox=group(farmTab,"Left","Auto Farm","sprout")
-    local labels,itemMap=API.AutoFarmItems()
     local selectedLabel=DB[S.farm.config.item].name.." ["..S.farm.config.item.."]"
+    local labels,itemMap={selectedLabel},{[selectedLabel]=S.farm.config.item}
     S.farmItemOption=farmBox:AddDropdown("GBFarmItem",{Text="Item",Values=labels,Default=selectedLabel,
         Callback=function(value)
             if S.farm.running then return end
@@ -3802,7 +3809,7 @@ local function buildUI()
     local utilStatus = group(utilities, "Right", "Status", "activity")
     S.utilityLabel = utilStatus:AddLabel("Ready", true)
 
-    local configOK, configError = pcall(function()
+    local configOK, configError = xpcall(function()
         for name, fn in {isfolder=isfolder, isfile=isfile, listfiles=listfiles, makefolder=makefolder,
             readfile=readfile, writefile=writefile, delfile=delfile} do
             assert(type(fn)=="function", "Executor filesystem API unavailable: " .. name)
@@ -3810,16 +3817,26 @@ local function buildUI()
         assert(type(isfolder)=="function" and type(isfile)=="function" and type(listfiles)=="function"
             and type(makefolder)=="function" and type(readfile)=="function" and type(writefile)=="function"
             and type(delfile)=="function", "Executor does not support the required config file APIs")
-        local manager = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/Alexandria/main/addons/SaveManager.lua"))()
+        local fn=managerLoader
+        if not fn then
+            local body=game:HttpGet("https://raw.githubusercontent.com/joustingmatch/Alexandria/main/addons/SaveManager.lua")
+            local err;fn,err=loadstring(body)
+            assert(fn, tostring(err))
+        end
+        local manager=fn()
         setupConfigManager(manager, library, cfg)
-    end)
+    end, debug.traceback)
     if not configOK then
         S.configSystem = {ready = false, error = tostring(configError)}
         group(cfg, "Right", "Configuration", "folder-cog"):AddLabel("Config unavailable: " .. tostring(configError), true)
     end
-    if not S.running then pcall(API.PreviewAutoFarm) end
     task.spawn(function()
         while S.live do
+            if S.farmItemRefresh then
+                local refresh=S.farmItemRefresh;S.farmItemRefresh=nil
+                labels,itemMap=refresh.labels,refresh.map
+                pcall(function() S.farmItemOption:SetValues(labels) end)
+            end
             flushToggleRequests()
             if S.farmLabel then pcall(function()
                 local f, a = S.farm, API.AutoFarmStatus()
@@ -3864,6 +3881,11 @@ local function buildUI()
             end)
             task.wait(0.5)
         end
+    end)
+    task.spawn(function()
+        local ok,newLabels,newMap=pcall(API.AutoFarmItems)
+        if ok and S.live then S.farmItemRefresh={labels=newLabels,map=newMap} end
+        if S.live and not S.running then pcall(API.PreviewAutoFarm) end
     end)
 
 end
