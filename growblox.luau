@@ -260,7 +260,7 @@ function UiText.harvestValue(value)
     error("Invalid harvest mode")
 end
 function UiText.farmAction(f)
-    if f.needsAttention then return "Waiting" end
+    if f.needsAttention or f.waitReason and f.waitReason:find("Verify planting",1,true) then return "Verification needed" end
     if not f.running then return (f.pending or next(f.trees or {}) or #(f.manifest or {}) > 0) and "Paused" or "Idle" end
     return ({prepare="Scanning", materials="Waiting for items", place="Placing", ["break"]="Breaking",
         loot="Collecting", plant="Planting", wait="Growing", harvest="Harvesting"})[f.phase] or "Working"
@@ -2782,17 +2782,40 @@ function FarmCore.step(f, e)
         f.manifest, f.cashback = {}, 0
         if f.remaining > 0 then phase("place") else phase("plant") end
     elseif f.phase == "plant" then
+        if e.parkBlocks and f.counts and (f.counts[id] or 0)>0 then
+            assert(e.parkBlocks(id), "Waiting for block storage confirmation")
+            return
+        end
         local t = f.plan.slots[f.cursor]
-        if not t then phase("wait"); return end
+        if not t then
+            for k,entry in pairs(f.unresolved or {}) do
+                local tree=e.tree(entry.target)
+                if tree and tree.id==entry.id then f.trees[k]=entry.target;f.unresolved[k]=nil end
+            end
+            local k=next(f.unresolved or {})
+            if k then f.waitReason="Verify planting at "..k;e.idle(2);return end
+            phase("wait"); return
+        end
         if not f.pending and e.tile(t) ~= 0 then f.cursor += 1; return end
         if not f.pending then
             local available = f.counts and f.counts[seed]
             if available == nil then available = e.inventory()[seed] or 0 end
-            if available == 0 and not e.fetch(seed) then phase("wait"); return end
+            if available == 0 and not e.fetch(seed) then f.cursor=#f.plan.slots+1;return end
             f.pending = {kind = "plant", target = t, id = seed, before = available}
             e.save()
         end
-        assert(e.place(f.pending), "Waiting for planting acknowledgement; no blind resend")
+        if not e.place(f.pending) then
+            local pending=f.pending
+            if pending.sent and e.tile(t)==0 and not e.tree(t) and (f.unconfirmedPlants or 0)<2 then
+                f.unresolved=f.unresolved or {}
+                f.unresolved[FarmCore.key(t)]={target=t,id=pending.id,before=pending.before}
+                f.unconfirmedPlants=(f.unconfirmedPlants or 0)+1
+                f.pending=nil;f.cursor+=1;e.save()
+                return
+            end
+            error("Waiting for planting acknowledgement; no blind resend")
+        end
+        f.unconfirmedPlants=0
         f.trees[FarmCore.key(t)] = t
         f.pending = nil; f.planted += 1; f.cursor += 1
     elseif f.phase == "wait" then
@@ -2882,7 +2905,7 @@ end
 local function farmSave()
     if not f.boundWorld or type(writefile)~="function" then return end
     local out={version=1,world=f.boundWorld,user=game.Players.LocalPlayer.UserId,config=f.config,phase=f.phase,
-        manifest=f.manifest,trees=f.trees,deferred=f.deferred,remaining=f.remaining,cashback=f.cashback,
+        manifest=f.manifest,trees=f.trees,deferred=f.deferred,unresolved=f.unresolved,unconfirmedPlants=f.unconfirmedPlants,remaining=f.remaining,cashback=f.cashback,
         cursor=f.cursor,pending=f.pending,cycle=f.cycle,placed=f.placed,broken=f.broken,planted=f.planted,harvested=f.harvested}
     local ok,err=pcall(function() writefile(f.checkpointFile,game:GetService("HttpService"):JSONEncode(out)) end)
     f.checkpointError=not ok and tostring(err) or nil
@@ -3246,6 +3269,28 @@ local function put(p)
     if not p.sent then
         assert(tile(0,t.x,t.y)==0,"Target occupied; no overwrite/splice")
         moveTo(t,true)
+        if p.kind=="plant" then
+            local px,py=position()
+            local center=t.x+0.5
+            if math.abs(px-center)<0.95 then
+                stopFarmStride()
+                local direction=px>=center and 1 or -1
+                local stance=t.x+direction
+                assert(stance>=0 and stance<world.w and passable(tile(0,stance,t.y)),"Planting stance blocked")
+                local started=os.clock()
+                repeat
+                    checkSession()
+                    px,py=position()
+                    assert(grounded() and math.abs(py-t.floor)<0.25,"Planting stance lost ground")
+                    if math.abs(px-center)>=0.99 then break end
+                    inputKey(direction==1 and Enum.KeyCode.D or Enum.KeyCode.A,true)
+                    task.wait(0.015)
+                until os.clock()-started>1
+                releaseMovement()
+                px=position()
+                assert(math.abs(px-center)>=0.95,"Unable to align planting stance")
+            end
+        end
         local delay=math.max(0,0.15-(os.clock()-(f.lastPlaceSent or -math.huge)))
         if delay>0 then task.wait(delay);checkSession() end
         assert(grounded() and accessible(t.x,t.y) and inRange(t.x,t.y),"Unsafe placement stance")
@@ -3307,6 +3352,7 @@ local function remove(t,harvest)
 end
 local env={inventory=inventoryNow,scan=scan,stored=boxTotal,fetch=fetch,tile=function(t)return tile(0,t.x,t.y)end,
     place=put,remove=remove,tree=treeAt,loot=loot,sweep=sweep,save=farmSave,
+    parkBlocks=function(id) stopFarmStride();return store(id) end,
     ripe=function(tree)return FarmCore.ready(tree,seedDB,workspace:GetServerTimeNow())end,
     eta=function(tree)return math.max(0,tree.p+seedDB.grow-workspace:GetServerTimeNow())end,
     pool=function(id) syncDeferred();local n=(inventoryNow()[id] or 0)+boxTotal(id);for _,d in f.deferred do if d.id==id then n+=d.n end end;return n end,
@@ -3350,7 +3396,7 @@ function API.ConfigureAutoFarm(item,mode)
         if f.pending and not f.pending.sent and tile(0,f.pending.target.x,f.pending.target.y)==0 then f.pending=nil end
         local unfinished=false
         for _,t in f.manifest do if not t.done or tile(0,t.x,t.y)~=0 then unfinished=true end end
-        assert(not next(f.trees) and not unfinished and not f.pending,"Finish/resume the old batch before switching item")
+        assert(not next(f.trees) and not next(f.unresolved or {}) and not unfinished and not f.pending,"Finish/resume the old batch before switching item")
         f.manifest={}
         f.phase="prepare";f.cursor=1;f.remaining=nil
     end
@@ -3375,12 +3421,17 @@ function API.LoadAutoFarmCheckpoint()
         local canonical=valid[FarmCore.key(t)];assert(canonical and k==FarmCore.key(t) and treeAt(t) and treeAt(t).id==f.config.item+1,"Checkpoint tree changed")
         p.trees[k]=table.clone(canonical)
     end
+    for k,entry in pairs(p.unresolved or {}) do
+        local canonical=entry.target and valid[FarmCore.key(entry.target)]
+        assert(canonical and k==FarmCore.key(entry.target) and entry.id==f.config.item+1,"Invalid unresolved planting")
+        entry.target=table.clone(canonical)
+    end
     if p.pending then
         local canonical=valid[FarmCore.key(p.pending.target)]
         assert(canonical and (p.pending.id==f.config.item or p.pending.id==f.config.item+1),"Invalid pending operation")
         p.pending.target=table.clone(canonical)
     end
-    for _,k in {"phase","manifest","trees","deferred","remaining","cashback","cursor","pending","cycle","placed","broken","planted","harvested"} do f[k]=p[k] end
+    for _,k in {"phase","manifest","trees","deferred","unresolved","unconfirmedPlants","remaining","cashback","cursor","pending","cycle","placed","broken","planted","harvested"} do f[k]=p[k] end
     f.config=p.config;f.plan=plan;f.boundWorld=world.name;f.message="Checkpoint loaded, OFF - toggle ON to resume"
     return {phase=f.phase,manifest=#f.manifest}
 end
@@ -3392,7 +3443,7 @@ function API.StartAutoFarm(options)
     if not f.boundWorld and type(isfile)=="function" and isfile(f.checkpointFile) then
         local p=game:GetService("HttpService"):JSONDecode(readfile(f.checkpointFile))
         if p.world==world.name and p.user==game.Players.LocalPlayer.UserId then
-            local unfinished=p.pending or next(p.trees or {}) or #(p.manifest or {})>0 or (p.phase~="prepare" and p.phase~="wait")
+            local unfinished=p.pending or next(p.trees or {}) or next(p.unresolved or {}) or #(p.manifest or {})>0 or (p.phase~="prepare" and p.phase~="wait")
             if unfinished then
                 assert(p.config.item==f.config.item,"Unfinished checkpoint for another item; select that item and load checkpoint first")
                 API.LoadAutoFarmCheckpoint()
@@ -3906,7 +3957,7 @@ local function buildUI()
                 if S.farmItemOption.Value ~= item then S.farmItemOption:SetValue(item) end
                 if S.farmHarvestOption.Value ~= mode then S.farmHarvestOption:SetValue(mode) end
                 local action = S.farmUiStarting and "Starting" or UiText.farmAction(f)
-                S.farmLabel:SetText(UiText.panel(action, a.error or a.checkpointError) .. string.format(
+                S.farmLabel:SetText(UiText.panel(action, a.error or a.checkpointError or (f.waitReason and f.waitReason:find("Verify planting",1,true) and f.waitReason)) .. string.format(
                     "\nFloor: %s/%d\nBatch: %d/%d\nBlocks: %d | Seeds: %d\nTrees: %d/%d ready\nETA: %ds\nPlaced: %d | Broken: %d\nHarvested: %d\nGems: +%d\nDrops: %d\nStorage: %s",
                     tostring(a.row or "-"), a.rows, math.min(a.cursor, a.batch), a.batch,
                     a.block, a.seed, a.ripe, a.trees, math.ceil(a.eta), a.placed, a.broken,
