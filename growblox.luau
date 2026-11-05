@@ -1,6 +1,5 @@
--- Growblox v0.12 | MANIFEST AUTO FARM | native A/D/Space only
--- UI adapted from ../hush/UI_GUIDE.md and scripts/hush.luau.
--- Starts idle. Never changes ItemDB or clears on load. Probe instrumentation is scoped/restored.
+
+
 local E = getgenv()
 local previousResults = E.GrowbloxHub and E.GrowbloxHub.State.results or {}
 local previousProgress = E.GrowbloxHub and E.GrowbloxHub.State.progress
@@ -8,7 +7,94 @@ local previousMovement = E.GrowbloxHub and E.GrowbloxHub.State.movement
 local previousLoot = E.GrowbloxHub and E.GrowbloxHub.State.loot
 local previousRecorder = E.GrowbloxHub and E.GrowbloxHub.State.recorder
 if previousProgress and previousProgress.movementMode ~= "native-input" then previousProgress = nil end
-if E.GrowbloxHub and E.GrowbloxHub.Unload then E.GrowbloxHub.Unload() end
+do
+    local seen, retired, errors = {}, {}, {}
+    local function attempt(fn)
+        local ok, err = pcall(fn)
+        if not ok then errors[#errors + 1] = tostring(err) end
+    end
+    local function retire(api)
+        if type(api) ~= "table" or seen[api] or type(api.State) ~= "table" then return end
+        local state = api.State
+        if not state.farm or not state.utilities or not state.movement then return end
+        seen[api] = true
+        retired[#retired + 1] = state
+        state.live, state.running, state.busy = false, false, false
+        state.generation = (state.generation or 0) + 1
+        for _, name in {"farm", "dirt", "specialDirt"} do
+            if state[name] then state[name].running = false end
+        end
+        if state.movement.keys then
+            for key in state.movement.keys do state.movement.keys[key] = false end
+        end
+        for _, name in {"worker", "farmUiTask", "inputPump", "uiWorker", "utilityWorker"} do
+            local thread = state[name]
+            if thread and thread ~= coroutine.running() then attempt(function() task.cancel(thread) end) end
+        end
+        if type(api.Unload) == "function" then task.spawn(function() attempt(api.Unload) end) end
+        if type(api.SetUltraFPS) == "function" then task.spawn(function() attempt(function() api.SetUltraFPS(false) end) end) end
+        for _, connection in state.connections or {} do attempt(function() connection:Disconnect() end) end
+        for _, hook in state.utilities.hooks or {} do attempt(function()
+            local list = hook.packet.getListeners()
+            local index = table.find(list, hook.callback)
+            if index then table.remove(list, index) end
+        end) end
+        local privacy = state.privacy
+        if privacy then
+            privacy.active = false
+            privacy.epoch = (privacy.epoch or 0) + 1
+            for _, connection in privacy.connections or {} do attempt(function() connection:Disconnect() end) end
+        end
+        local library = state.library
+        if library then
+            for _, connection in library.Signals or {} do attempt(function() connection:Disconnect() end) end
+            if library.ScreenGui then attempt(function() library.ScreenGui:Destroy() end) end
+        end
+    end
+    retire(E.GrowbloxHub)
+    retire(E.BlizzardGrowbloxRuntime)
+    if type(filtergc) == "function" then attempt(function()
+        for _, api in filtergc("table", {Keys={"State", "Unload", "Snapshot", "SetUltraFPS"}}, false) do retire(api) end
+    end) end
+    for _ = 1, #retired do
+        for _, state in retired do
+            local u = state.privacy
+            if u and u.bitmap and u.bitmap._layout == u.wrapper then u.bitmap._layout = u.originalLayout end
+        end
+    end
+    attempt(function()
+        local net = require(game:GetService("ReplicatedStorage").Shared.Net)
+        local listeners = net.tileChanged.getListeners()
+        for i = #listeners, 1, -1 do
+            for _, upvalue in debug.getupvalues(listeners[i]) do
+                if table.find(retired, upvalue) then table.remove(listeners, i); break end
+            end
+        end
+    end)
+    local roots, seenGui = {}, {}
+    local function addRoot(root) if root then roots[#roots + 1] = root end end
+    attempt(function() addRoot(game:GetService("CoreGui")) end)
+    attempt(function() addRoot(game:GetService("Players").LocalPlayer.PlayerGui) end)
+    if type(gethui) == "function" then attempt(function() addRoot(gethui()) end) end
+    local removed = 0
+    for _, root in roots do attempt(function()
+        for _, gui in root:QueryDescendants("ScreenGui") do
+            if not seenGui[gui] then
+                seenGui[gui] = true
+                local owned = gui:GetAttribute("BlizzardHubOwner") == "Growblox"
+                if not owned and gui.Name == "Obsidian" then
+                    for _, label in gui:QueryDescendants("TextLabel") do
+                        if label.Text == "Blizzard Hub Freemium" or label.Text == "Growblox | Witching Hour" then owned = true; break end
+                    end
+                end
+                if owned then gui:Destroy(); removed += 1 end
+            end
+        end
+    end) end
+    E.BlizzardReloadReport = {retired=#retired, removedOrphanGuis=removed, errors=errors}
+    E.BlizzardGrowbloxRuntime = nil
+    if #retired > 0 then task.wait(0.05) end
+end
 local RS = game:GetService("ReplicatedStorage")
 assert(game.PlaceId == 112863874972771, "Growblox client required")
 local Net = require(RS.Shared.Net)
@@ -16,7 +102,7 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.12-autofarm", live = true, running = false, busy = false,
+    version = "0.13-interface", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil, uiRequests = {},
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
@@ -38,7 +124,7 @@ local S = {
         job = game.JobId, blocks = 0, seeds = 0, gems = 0, attempts = 0, denied = 0, fullItems = {}, retryAt = {}},
     movement = {mode = "native-input", validated = false, jumpValidated = false, keys = {},
         reason = "Previous goTo/hover engine caused flying kick; removed. Re-test normal input before Start."},
-    -- Restrict the prototype to natural tiles, never locks/furniture/trees.
+
     natural = {[2] = true, [4] = true, [10] = true},
     research = {
         experimentsPaused = true,
@@ -68,12 +154,13 @@ local S = {
     },
 }
 local displayPrivacyText = function(text) return tostring(text or "") end
-local API = {State = S}
+local UiText = {}
+local API = {State = S, UIText = UiText}
 E.GrowbloxHub = API
+E.BlizzardGrowbloxRuntime = API
 local executorIdentity = type(getthreadidentity) == "function" and getthreadidentity() or 8
 local function restoreExecutorContext()
-    -- Native game RPC wrappers resume coroutines from a game-script thread.
-    -- Restore only the context in which this executor script originally started.
+
     if type(setthreadidentity) == "function" then setthreadidentity(executorIdentity) end
 end
 if previousMovement and previousMovement.mode == "native-input" and previousMovement.validated
@@ -82,7 +169,6 @@ if previousMovement and previousMovement.mode == "native-input" and previousMove
     S.movement.reason = "Normal input calibration reused in the same server"
 end
 
--- Anchor identity in the installed game's packet listener, not arbitrary GC clones.
 local gameSource = "Players." .. game.Players.LocalPlayer.Name .. ".PlayerGui.GameGui.Game"
 local world, nativeAct, hit, controls, controlsIndex, inventory
 for _, f in Net.tileChanged.getListeners() do
@@ -124,7 +210,7 @@ for _, f in debug.getupvalues(nativeAct) do
     if type(f)=="function" and debug.info(f,"n")=="setTile" then nativeSetTile=f;break end
 end
 local function position()
-    -- Verified goTo upvalues 1/2 are the current tile-space player x/y.
+
     local x, y = debug.getupvalue(world.goTo, 1), debug.getupvalue(world.goTo, 2)
     assert(type(x) == "number" and type(y) == "number", "Position unavailable")
     return x, y
@@ -150,24 +236,54 @@ local function inRange(x, y)
     return math.abs(x + 0.5 - px) <= reach and math.abs(y + 0.5 - py) <= reach
 end
 local function key(layer, x, y) return layer .. ":" .. x .. ":" .. y end
+function UiText.line(value, fallback)
+    local text = tostring(value or ""):match("^[^\r\n]+") or ""
+    text = text:gsub("^.-:%d+:%s*", "")
+    return text ~= "" and text:sub(1, 140) or (fallback or "None")
+end
+function UiText.panel(action, err)
+    return "Action: " .. UiText.line(action, "Idle") .. "\nError: " .. UiText.line(err, "None")
+end
+function UiText.harvestLabel(value)
+    return value == "Tunggu Semua Matang" and "Wait Until All Mature" or "As Ready"
+end
+function UiText.harvestValue(value)
+    if value == "Wait Until All Mature" or value == "Tunggu Semua Matang" then return "Tunggu Semua Matang" end
+    if value == "As Ready" or value == "Bertahap" then return "Bertahap" end
+    error("Invalid harvest mode")
+end
+function UiText.farmAction(f)
+    if f.needsAttention then return "Waiting" end
+    if not f.running then return (f.pending or next(f.trees or {}) or #(f.manifest or {}) > 0) and "Paused" or "Idle" end
+    return ({prepare="Scanning", materials="Waiting for items", place="Placing", ["break"]="Breaking",
+        loot="Collecting", plant="Planting", wait="Growing", harvest="Harvesting"})[f.phase] or "Working"
+end
+function API.UIStatusText()
+    local p = S.progress
+    local action = "Idle"
+    if S.specialDirt.running then action = "Building tunnels"
+    elseif S.running and not S.farm.running and not S.dirt.running then
+        action = ({["mine-corridor"]="Breaking", ["obstacle-detour"]="Routing", ["walk"]="Walking"})[p and p.phase] or "Clearing"
+    elseif p and p.complete then action = "Complete"
+    elseif p and not p.complete then action = "Paused" end
+    local err = S.specialDirt.error or S.clearUIError or (p and (p.error or p.lastError))
+    return UiText.panel(action, err)
+end
 local function status(message)
     S.status = message
-    if S.label then pcall(function() S.label:SetText(displayPrivacyText((tostring(message):match("^[^\r\n]+") or "Idle"):sub(1, 110))) end) end
+    if S.label then pcall(function() S.label:SetText(displayPrivacyText(API.UIStatusText())) end) end
 end
 
--- ByteNet listen has no disposer; remove precisely our listener on Unload.
 local function changed(p)
     if not S.live or p.w ~= Net.worldTag(world.name or "") then return end
-    -- Wire layers: 1=foreground, 2=background; local API uses 0/1.
+
     if p.layer ~= 1 and p.layer ~= 2 then return end
     S.events[key(p.layer - 1, p.x, p.y)] = {id = p.id, at = os.clock(), world = world.name}
 end
 Net.tileChanged.listen(changed)
 local inputService = game:GetService("UserInputService")
 local virtualInput = game:GetService("VirtualInputManager")
--- Dedicated executor input pump never calls a game RPC. Native Net.call can
--- resume its caller with game-script capabilities even if its numeric identity
--- is restored to 8; movement requests therefore cross a plain-data queue.
+
 local sentKeys, lastSentAt = {}, {}
 local function inputKey(key, down)
     assert(not S.inputError, S.inputError)
@@ -196,14 +312,14 @@ local function requestToggle(key,value)
     S.uiRequests[key] = value == true
 end
 local function syncClearToggle(value) requestToggle("clear",value) end
--- Called only by the UI-owned updater, never by an RPC-resumed worker.
+
 local function flushToggleRequests()
     for key,value in S.uiRequests do
         local field,flag
         if key=="clear" then field,flag="clearToggle","changingClearToggle"
         elseif key=="dirt" then field,flag="dirtToggle","changingDirtToggle"
         elseif key=="specialDirt" then field,flag="specialDirtToggle","changingSpecialDirtToggle"
-        elseif key=="farm" then field,flag="farmToggle","changingFarmToggle" end
+        elseif key=="farm" and not (S.farmUiStarting and value==false) then field,flag="farmToggle","changingFarmToggle" end
         local control=field and S[field]
         if control then
             S[flag]=true
@@ -215,6 +331,11 @@ local function flushToggleRequests()
     end
 end
 function API.Stop(reason)
+    if S.farmUiTask and S.farmUiTask ~= coroutine.running() then
+        pcall(task.cancel, S.farmUiTask)
+        S.farmUiTask, S.farmUiStarting = nil, false
+        S.farmUiEpoch = (S.farmUiEpoch or 0) + 1
+    end
     S.farm.running = false
     S.farm.testSlotLimit=nil
     if API.SaveAutoFarmCheckpoint then API.SaveAutoFarmCheckpoint() end
@@ -247,15 +368,30 @@ function API.Stop(reason)
     syncClearToggle(false)
 end
 function API.Unload()
-    if API.CleanupUtilities then API.CleanupUtilities() end
-    if API.StopRecording then API.StopRecording("script unload") end
-    API.Stop("script reload/unload")
+    if S.unloading then return end
+    S.unloading = true
     S.live = false
-    local listeners = Net.tileChanged.getListeners()
-    local index = table.find(listeners, changed)
-    if index then table.remove(listeners, index) end
-    for _, c in S.connections do c:Disconnect() end
-    if S.library then pcall(function() S.library:Unload() end) end
+    S.unloadErrors = {}
+    local function clean(fn)
+        local ok, err = pcall(fn)
+        if not ok then S.unloadErrors[#S.unloadErrors + 1] = tostring(err) end
+    end
+    clean(function() API.Stop("script reload/unload") end)
+    if API.StopRecording then clean(function() API.StopRecording("script unload") end) end
+    if API.CleanupPrivacy then clean(API.CleanupPrivacy) end
+    if API.CleanupUtilities then clean(API.CleanupUtilities) end
+    clean(function()
+        local list = Net.tileChanged.getListeners()
+        local index = table.find(list, changed)
+        if index then table.remove(list, index) end
+    end)
+    for _, connection in S.connections do clean(function() connection:Disconnect() end) end
+    if S.library then
+        clean(function() S.library:Unload() end)
+        clean(function() if S.library.ScreenGui then S.library.ScreenGui:Destroy() end end)
+    end
+    if E.GrowbloxHub == API then E.GrowbloxHub = nil end
+    if E.BlizzardGrowbloxRuntime == API then E.BlizzardGrowbloxRuntime = nil end
 end
 function API.Snapshot()
     local x, y = position()
@@ -265,8 +401,7 @@ function API.Snapshot()
         reach = controls.punchRange(), power = controls.handPower(), dig = controls.handDig(),
         progress = S.progress}
 end
--- Explicit same-world re-entry used for authoritative verification.
--- EnterWorld may reset the player to spawn; never use it mid-navigation.
+
 function API.VerifyServerWorld(confirmedName)
     assert(not S.running and not S.busy, "Stop work before requesting snapshot")
     assert(confirmedName == world.name, "Only the current world may be verified")
@@ -306,8 +441,7 @@ local function passable(id)
     local d = DB[id or 0]
     return id == 0 or (d ~= nil and not d.solid and not d.hurts and (d.kind ~= "seed" or (S.farm and S.farm.running)))
 end
--- Bedrock identity is unchanged. Classification is geometric: only a connected
--- component reaching y=h-1 is basal; the isolated spawn pedestal is not a floor.
+
 local function bedrockComponent(x,y)
     if tile(0,x,y)~=8 then return nil end
     local nodes,seen,head={{x=x,y=y}},{[y*world.w+x]=true},1
@@ -331,16 +465,14 @@ end
 API.BedrockInfo=bedrockComponent
 local function canStand(x, y)
     if not (x >= 0 and x < world.w and y >= (S.farm.running and 0 or 1) and y < world.h and passable(tile(0, x, y))) then return false end
-    -- Native farming demo and the Main Door spawn both stand in a one-cell
-    -- clear corridor below a solid ceiling. Do not impose a two-cell body on
-    -- this mode; the real game still performs all collisions via normal input.
+
     if (S.farm and S.farm.running) or (S.dirt and S.dirt.running) then return true end
     if passable(tile(0, x, y - 1)) then return true end
     local u=S.clearUnderpassBounds
     if u and y==u.y and x>=u.x0 and x<=u.x1 then
         local roof=tile(0,x,y-1)
         local def=DB[roof or 0]
-        -- One-cell native corridors, scoped to the small spawn detour only.
+
         return def~=nil and not def.hurts and (roof==8 or S.natural[roof]==true)
     end
     return false
@@ -348,7 +480,7 @@ end
 local function canMineFrom(px, py, x, y)
     local dx, dy = x + 0.5 - px, y + 0.5 - py
     if dx * dx + dy * dy > math.min(controls.punchRange() - 0.1, 2.2)^2 then return false end
-    -- Conservative collision ray from the avatar's body, not through protected solids.
+
     local eye = py - 0.75
     local n = math.max(1, math.ceil(math.max(math.abs(dx), math.abs(y + 0.5 - eye)) * 5))
     for i = 1, n do
@@ -418,11 +550,11 @@ function API.LoadCheckpoint()
     return {world = p.world, row = p.row, x = p.nextX, direction = p.direction}
 end
 local function sessionAlive(generation)
-    return S.live and S.running and S.generation == generation and world.name == S.boundWorld
+    return S.live and E.BlizzardGrowbloxRuntime == API and S.running and S.generation == generation and world.name == S.boundWorld
 end
 local function active(generation)
     if not sessionAlive(generation) then return false end
-    -- Chat/UI focus and Frozen are temporary input gates, not end-of-run events.
+
     local waiting = false
     while inputService:GetFocusedTextBox() ~= nil or game.Players.LocalPlayer:GetAttribute("Frozen") do
         if not sessionAlive(generation) then return false end
@@ -449,9 +581,7 @@ local function supported(x, y)
     local d = DB[tile(0, x, y + 1) or 0]
     return d ~= nil and not d.hurts and (d.solid == true or d.platform == true)
 end
--- Ground contact is not route/headroom clearance. Use the nearest floor
--- plane, not floor(py-0.02): small positive collision offsets crossed a whole
--- cell boundary and falsely labelled a resting avatar as airborne.
+
 local function contactFloor(py)
     local fy=math.floor(py+0.5)
     if fy<1 or fy>=world.h or math.abs(py-fy)>0.12 then return nil end
@@ -494,8 +624,7 @@ local function jumpArcClear(sx, sy, nx, ny)
     if not S.movement.jumpValidated then return false end
     local height = S.movement.maxJumpHeight or 0
     if height < 1 or sy - ny > height - 0.05 or ny - sy > 2 then return false end
-    -- Check the launch/landing clearance and apex using the measured normal jump.
-    -- Supported two-cell ledges were previously missing from the navigation graph.
+
     local apex = sy + 0.99 - height - 0.05
     local function bodyClear(px, py)
         for bodyY = math.floor(py - 1.8), math.floor(py - 0.03) do
@@ -610,7 +739,7 @@ local function follow(path, generation)
         releaseMovement()
         if not arrived then return false, "Normal-input movement stalled; paused without forcing position" end
         task.wait(0.14)
-        -- Brake/align with short real key pulses; never pin the position against inertia.
+
         for _ = 1, 6 do
             if not active(generation) then releaseMovement(); return false, "Paused" end
             local px, py = position()
@@ -638,8 +767,7 @@ local function follow(path, generation)
     if not waitGrounded(1.5, generation) then return false, "Did not land normally" end
     return true
 end
--- Manual-demo engine: work from the cleared corridor, never pre-position ABOVE
--- every target. General graph search is reserved for entry and obstacle detours.
+
 local function rowFrontier(y, bounds)
     local first, last
     for x = bounds.x0, bounds.x1 do
@@ -707,7 +835,7 @@ local function navigate(x, y, generation, stay)
         S.progress.phase = "corner-descent"
         return true
     end
-    -- Normal case: punch the adjacent tile from BEHIND in the cleared row.
+
     if not ownSupport and canMineFrom(px, py, x, y) then
         S.progress.phase = "mine-corridor"
         return true
@@ -809,7 +937,7 @@ collectNearby = function(force)
                 local bucket = isGem and "gems" or (def and def.kind == "seed" and "seeds" or "blocks")
                 S.loot[bucket] += got; claimed += got; gotGems = gotGems or isGem
                 if not isGem then S.loot.counts[d.id] = (S.loot.counts[d.id] or 0) + got end
-                -- Remove a client visual only after the server acknowledged this exact UID.
+
                 if got >= beforeN then
                     local list = world.dropList()
                     local index = table.find(list, d)
@@ -824,7 +952,7 @@ collectNearby = function(force)
     end
     if claimed > 0 then refreshLootInventory() end
     if gotGems then refreshGems() end
-    if S.lootLabel then pcall(function() S.lootLabel:SetText(string.format("Picked: block %d | seed %d\nGems +%d | server %s", S.loot.blocks, S.loot.seeds, S.loot.gems, tostring(S.loot.serverGems or "-"))) end) end
+    if S.lootLabel then pcall(function() S.lootLabel:SetText(string.format("Blocks: %d | Seeds: %d\nGems: +%d", S.loot.blocks, S.loot.seeds, S.loot.gems)) end) end
     return claimed
 end
 function API.CollectNearby()
@@ -836,7 +964,7 @@ local function originalTileListener()
 end
 local function verifyRun(run, final)
     if not final then
-        -- Live corrections are observed without re-entering/resetting the running world.
+
         for _, t in run.targets do
             if not t.settledChecked then
                 t.afterSettled, t.settledChecked = tile(t.layer, t.x, t.y), true
@@ -865,7 +993,7 @@ local function verifyRun(run, final)
         end
     end
     S.progress.serverRemaining = countRemaining(S.progress.bounds, grids[0], grids[1]).total
-    -- Includes removals before a manual Pause, whose worker may have been cancelled mid-batch.
+
     S.progress.serverCleared = math.max(0, S.progress.initial - S.progress.serverRemaining)
     S.progress.verifications += 1
     S.serverRead = {ok = true, a = true, b = data, at = os.clock(), world = data.name}
@@ -895,8 +1023,7 @@ local function mineLayer(x, y, layer, generation, run)
         S.nativeCalls += 1; S.progress.hits += 1
         if tile(layer, x, y) == 0 then break end
         if attempt >= needed + 1 then
-            -- An invocation is not proof of an accepted hit. Back off normally;
-            -- never reset the native cooldown or manufacture extra hit packets.
+
             S.mining.effectiveInterval = math.min(0.6, math.max(0.35, S.mining.effectiveInterval + 0.05))
             S.mining.backoffs += 1
         end
@@ -910,7 +1037,7 @@ local function mineLayer(x, y, layer, generation, run)
     run.targets[#run.targets + 1] = t
     if layer == 0 then S.progress.foreground += 1 else S.progress.background += 1 end
     S.localCleared += 1
-    task.wait(math.max(0.35, S.config.interval, S.mining.effectiveInterval)) -- native cadence, not a cooldown bypass
+    task.wait(math.max(0.35, S.config.interval, S.mining.effectiveInterval))
     if not waitGrounded(2, generation) then return false, "Corner descent did not land normally" end
     t.afterSettled = tile(layer, x, y)
     if t.afterSettled ~= 0 then return false, "Tile was corrected after normal mining" end
@@ -990,7 +1117,7 @@ local function clearCell(x, y, generation, run, stay)
     local fg = tile(0, x, y)
     if fg ~= 0 and not eligible(0, x, y) then
         S.progress.protected += 1
-        return true -- locks/obsidian/bedrock/doors and their backgrounds stay intact
+        return true
     end
     if fg == 0 and (not S.config.background or not eligible(1, x, y)) then return true end
     local reached, why = navigate(x, y, generation, stay)
@@ -1010,8 +1137,7 @@ local function clearCell(x, y, generation, run, stay)
         local ok, err = mineLayer(x, y, layer, generation, run)
         if not ok then return false, err end
     end
-    -- Walk into the cell JUST cleared, on its remaining floor, like the demo.
-    -- No per-cell graph search, center alignment loop, or fixed pickup sleep.
+
     if supported(x, y) then
         S.progress.phase = "advance-corridor"
         local px, py = position()
@@ -1019,8 +1145,7 @@ local function clearCell(x, y, generation, run, stay)
         if math.abs(py - (y + 0.999)) <= 0.25 and math.abs(px - x - 0.5) <= 1.6 then
             moved, why = corridorStep(x, y, generation)
         else
-            -- Newly opened cell can be one level below us: normal drop path,
-            -- NOT a horizontal corridor command issued at the wrong height.
+
             local path, err = pathTo(x, y, true)
             if path then moved, why = follow(path, generation) else why = err end
         end
@@ -1033,8 +1158,6 @@ local function clearCell(x, y, generation, run, stay)
     return true
 end
 
--- Deliberately no Heartbeat position hold, goTo call, teleport or velocity override.
--- Validate real game input first; an untested movement replacement cannot start clearing.
 function API.CalibrateGrounded()
     assert(not S.running and not S.busy, "Pause first")
     assert(inputService:GetFocusedTextBox() == nil, "Close the focused text box first")
@@ -1082,7 +1205,6 @@ function API.CalibrateGrounded()
 end
 API.NavigationProbe = API.CalibrateGrounded
 
--- Passive manual-farming recorder. No movement, take requests, chat capture, or blocked packets.
 local function recordEvent(kind, payload)
     local r = S.recorder
     if not r or not r.active then return end
@@ -1225,11 +1347,6 @@ local function punch(t)
     S.sent += 1
 end
 
--- Explicit bounded experiments only, never called during loading/Preview.
--- mode=instant: one zero-id tile request, no hit prelude.
--- mode=rapid: native hit calls at 0.05s (client-side cooldown experiment).
--- mode=native/normal: native hit calls at 0.35s (baseline).
--- mode=multi: native hit calls for <=3 tiles in one tick, NOT one AoE packet.
 function API.Probe(mode, targets)
     assert(not S.research.experimentsPaused or mode == "normal" or mode == "native", "Experiments paused; focus Auto Clear World")
     assert(not S.running and not S.busy, "Another operation is active")
@@ -1246,7 +1363,7 @@ function API.Probe(mode, targets)
     local bypass = mode == "cooldown" or mode == "multi-cooldown"
     local oldTime
     if bypass then
-        -- v1033: hit upvalue 5 changed from -10 to the exact last-hit clock in probes.
+
         oldTime = debug.getupvalue(hit, 5)
         assert(type(oldTime) == "number" and oldTime <= os.clock() + 1, "Cooldown layout changed")
     end
@@ -1292,7 +1409,7 @@ function API.Start(region)
     assert(not (S.recorder and S.recorder.active), "Stop demonstration recording before autoclear")
     assert(S.movement.validated and S.movement.jumpValidated and S.movement.world == world.name and S.movement.job == game.JobId,
         "Start locked: validate normal walk/jump after reconnect; old flying movement is disabled")
-    S.config.background = true -- requested snake flow always clears the cave layer too
+    S.config.background = true
     local p = S.progress
     if region or not p or p.routeVersion ~= 3 or p.mode ~= "world-clear" or p.movementMode ~= "native-input" or p.engine ~= S.engine or p.world ~= world.name or p.job ~= game.JobId or not p.bounds or p.complete then
         local plan = API.Preview(region)
@@ -1315,7 +1432,7 @@ function API.Start(region)
     S.running, S.busy, p.state = true, true, "Running"
     p.finishedAt = nil
     syncClearToggle(true)
-    p.lastError = nil -- preserve the last stop reason for diagnosis after Resume
+    p.lastError = nil
     S.worker = task.spawn(function()
         local run = {mode = "world-clear", protocol = "wire-layer-1-2", world = S.boundWorld,
             bounds = table.clone(p.bounds), targets = {}, started = os.clock()}
@@ -1324,7 +1441,7 @@ function API.Start(region)
         local ok, err = xpcall(function()
             while active(generation) and p.row <= p.bounds.y1 do
                 if not p.rowEntered then
-                    -- Fast-forward empty rows without sending any movement input.
+
                     while p.row <= p.bounds.y1 and not enterRow(p) do
                         p.row += 1; p.rowEntered = false
                     end
@@ -1343,14 +1460,14 @@ function API.Start(region)
                     p.lastRecovery = tostring(why)
                     p.state = "Recovering"
                     status(string.format("Recovering %d/3: %s", attempt, tostring(why)))
-                    -- Never punch or force position while falling; wait for real physics.
+
                     waitGrounded(6, generation)
                     if not active(generation) then return end
                     task.wait(0.25 * attempt)
                     p.state = "Running"
                 end
                 if p.edgePending then
-                    -- Grounded pathfinding chooses a normal drop/jump at the corner; never force a descent.
+
                     p.edgePending = false
                 end
                 p.nextX += p.direction
@@ -1389,7 +1506,7 @@ function API.Start(region)
             if active(generation) then
                 collectNearby(true)
                 p.remainingDrops = API.DropSummary()
-                -- Stop movement before the final authoritative re-entry (which returns to spawn).
+
                 S.running = false
                 releaseMovement()
                 local verified, failure = verifyRun(run, true)
@@ -1418,8 +1535,6 @@ function API.Start(region)
 end
 API.Resume = API.Start
 
--- Alternative bounded tests: isolated hit closure with copied combat dispatch.
--- No changes to ItemDB, equipped items, original hit constants, or cooldowns.
 function API.ProbeAlternative(mode, targets)
     assert(not S.research.experimentsPaused, "Experiments paused; focus Auto Clear World")
     assert(not S.busy and not S.running, "Another operation is active")
@@ -1466,8 +1581,7 @@ function API.ProbeAlternative(mode, targets)
             end
             assert(debug.getupvalue(alternate, controlsIndex) == copied, "Clone setup failed")
             if mode == "wire-burst" or mode == "wire-batch" or mode == "wire-paced" then
-                -- Confirmed Others.sendHit protocol: kind=6 and tile center x/y.
-                -- Send only the missing hit preludes, then let native hit emit the final hit/removal.
+
                 for _ = 1, DB[t.before].hits - 1 do
                     assert(S.live and world.name == bound and S.generation == generation and inRange(t.x, t.y), "Cancelled")
                     punch(t)
@@ -1476,8 +1590,7 @@ function API.ProbeAlternative(mode, targets)
                 end
             end
             if mode == "punch-burst" or mode == "punch-paced" or mode == "punch-multi" then
-                -- Full-action trace exposed kind=1 punch-start, separate from kind=6 impact.
-                -- Test ordered punch-start preludes rather than visual-only impact spam.
+
                 for _ = 1, DB[t.before].hits do
                     assert(S.live and world.name == bound and S.generation == generation and inRange(t.x, t.y), "Cancelled")
                     Net.act.send({kind = 1, x = t.x + 0.5, y = t.y + 0.5})
@@ -1512,11 +1625,11 @@ function API.ProbeAlternative(mode, targets)
                     if mode == "act-power" then copiedWorld.punchReady = 0 end
                     local px = (t.x + 0.5 - debug.getupvalue(act, 2)) * debug.getupvalue(act, 4)
                     local py = (t.y + 0.5 - debug.getupvalue(act, 5)) * debug.getupvalue(act, 4)
-                    -- act's argument is input source; its cursor is upvalue 3, not the argument.
+
                     debug.setupvalue(action, 3, Vector2.new(px, py))
                     r.cursorScoped = debug.getupvalue(act, 3) ~= savedMouse
                     action(1)
-                    -- This executor shares the cursor cell; restore before any deliberate yield.
+
                     debug.setupvalue(act, 3, savedMouse)
                     r.nativeCalls += 1
                     if mode == "act-native" then task.wait(0.35) end
@@ -1542,7 +1655,7 @@ function API.ProbeAlternative(mode, targets)
         r.actionRestored = r.actionRestored and debug.getupvalue(entry.f, entry.worldIndex) == world
             and debug.getupvalue(entry.f, entry.hitIndex) == hit and debug.getupvalue(entry.f, 3) == entry.mouse
     end
-    -- Defensive restoration even if an executor implements shared closure cells.
+
     if debug.getupvalue(hit, controlsIndex) ~= controls then debug.setupvalue(hit, controlsIndex, controls) end
     r.originalRestored = debug.getupvalue(hit, controlsIndex) == controls
     r.ok, r.error = ok, not ok and tostring(err) or nil
@@ -1551,7 +1664,7 @@ function API.ProbeAlternative(mode, targets)
     S.busy = false
     if ok and S.live and world.name == bound then
         r.snapshotOK = API.VerifyServerWorld(bound)
-        -- Repair optimistic client-only removals from the authoritative snapshot.
+
         if r.snapshotOK then
             for _, t in r.targets do
                 t.verifiedServerAfter, t.verifiedPersistence = t.serverAfter, t.persistenceConfirmed
@@ -1622,8 +1735,6 @@ function API.ExportRecipes()
     return {file = "growblox-recipes.tsv", rows = #Recipes}
 end
 
--- Pattern captured in BEVERLY: platforms x=1/98, Dirt x=2..97, rows 35/33.
--- Build UP from the highest complete floor; this mode never mines terrain/items.
 local function planDirtLayout(fg, db, width, height, topY)
     local left, right = 1, width - 2
     assert(width >= 6 and height >= 8, "World too small")
@@ -1691,7 +1802,7 @@ local function dirtWalk(x, floorY, generation)
         local px,py = position()
         assert(math.abs(py-floorY)<0.25 and grounded(), "Return to the build floor/platform before resuming")
         if math.abs(px-target)<=0.4 then return true end
-        -- Validate every supporting cell. No jumping gaps or position forcing.
+
         for sx=math.min(math.floor(px),x),math.max(math.floor(px),x) do
             local floor=DB[tile(0,sx,floorY) or 0]
             assert(floor and not floor.hurts and (floor.solid or floor.platform), "Gap/hazard in the lower support floor")
@@ -1804,7 +1915,7 @@ function API.StartDirtFarm()
                         local before=S.dirt.stock[wanted]
                         nativeSetTile("fg",x,y,wanted)
                         task.wait(math.max(0.25,d.config.interval))
-                        -- Native local placement is optimistic: check settlement AND server stock.
+
                         d.stock=refreshLootInventory()
                         assert(tile(0,x,y)==wanted,"Placement corrected/rejected; not retried blindly")
                         if (d.stock[wanted] or 0)>=before then
@@ -1844,17 +1955,11 @@ function API.StartDirtFarm()
     return plan
 end
 
-
-
--- ==============================================================================
--- SPECIAL DIRT FARM: TUNNEL DOWNWARDS & BUILD PLATFORMS (LOWER HALF AUTO BUILDER)
--- ==============================================================================
 local function planSpecialDirtLayout(fg, bg, db, width, height)
     local leftShaft, rightShaft = 0, width - 1
     local leftPlatform, rightPlatform = 1, width - 2
     local leftDirt, rightDirt = 2, width - 3
 
-    -- 1. Find base floor from upperside
     local baseFloor = nil
     for y = height - 2, 1, -1 do
         if fg[y] and fg[y][leftPlatform] == 102 and fg[y][rightPlatform] == 102 then
@@ -1862,9 +1967,8 @@ local function planSpecialDirtLayout(fg, bg, db, width, height)
             break
         end
     end
-    baseFloor = baseFloor or 35 -- fallback to row 35
+    baseFloor = baseFloor or 35
 
-    -- 2. Find bedrock boundary
     local bedrockTop = height
     for y = baseFloor + 1, height - 1 do
         local count = 0
@@ -1893,7 +1997,6 @@ local function planSpecialDirtLayout(fg, bg, db, width, height)
         local corridorY = floorY - 1
         table.insert(corridors, corridorY)
 
-        -- Shaft gaps at x=0 and x=width-1
         for _, x in ipairs({leftShaft, rightShaft}) do
             for _, y in ipairs({corridorY, floorY}) do
                 if not isDoorArea(x, y) then
@@ -1903,7 +2006,6 @@ local function planSpecialDirtLayout(fg, bg, db, width, height)
             end
         end
 
-        -- Corridor clearance at x=1..width-2
         for x = leftPlatform, rightPlatform do
             local y = corridorY
             if not isDoorArea(x, y) then
@@ -1912,7 +2014,6 @@ local function planSpecialDirtLayout(fg, bg, db, width, height)
             end
         end
 
-        -- Floor platforms at x=1 and x=width-2
         for _, x in ipairs({leftPlatform, rightPlatform}) do
             local current = fg[floorY] and fg[floorY][x] or 0
             if current ~= 102 then
@@ -1922,7 +2023,6 @@ local function planSpecialDirtLayout(fg, bg, db, width, height)
             end
         end
 
-        -- Floor dirt line at x=2..width-3
         for x = leftDirt, rightDirt do
             if not isDoorArea(x, floorY) then
                 local current = fg[floorY] and fg[floorY][x] or 0
@@ -2101,8 +2201,7 @@ function API.StartSpecialDirtFarm()
 
             local function ensureAvatarOnFloor(targetFloorY, gen)
                 local px, py = position()
-                -- When standing normally on top of targetFloorY, py is approximately targetFloorY - 0.001 (e.g. 40.999 for floor 41).
-                -- Only trigger jump if avatar physically slipped below the platform (py >= targetFloorY + 0.4).
+
                 if py > (targetFloorY + 0.4) then
                     inputKey(Enum.KeyCode.Space, true)
                     task.wait(0.12)
@@ -2116,7 +2215,6 @@ function API.StartSpecialDirtFarm()
                 local floorY = plan.floors[fIdx]
                 local corridorY = floorY - 1
 
-                -- Safety check: ensure avatar is standing on top of floorY, not below it!
                 ensureAvatarOnFloor(floorY, generation)
 
                 local px, py = position()
@@ -2153,8 +2251,7 @@ function API.StartSpecialDirtFarm()
                             specialPlaceTile(currentX, floorY, 102, generation)
                         end
                     else
-                        -- NEVER mine the floor under avatar's feet! Keep existing Dirt/Rock as solid floor.
-                        -- Only patch missing air gaps with Dirt.
+
                         local curFloorTile = tile(0, currentX, floorY)
                         if curFloorTile == 0 then
                             specialPlaceTile(currentX, floorY, 2, generation)
@@ -2183,21 +2280,17 @@ function API.StartSpecialDirtFarm()
                     local nextFloorY = plan.floors[fIdx + 1]
                     local nextCorridorY = nextFloorY - 1
 
-                    -- Pre-clear corridor below end platform
                     specialMineCell(endPlatform, nextCorridorY, generation)
                     specialMineCell(endShaft, nextCorridorY, generation)
 
-                    -- Pre-place the platform on the next floor so avatar lands on a platform, not an abyss!
                     if tile(0, endPlatform, nextFloorY) ~= 102 then
                         specialPlaceTile(endPlatform, nextFloorY, 102, generation)
                     end
 
-                    -- Step into the edge to descend
                     walkToX(endPlatform + 0.5, generation)
                     task.wait(0.3)
                     waitGrounded(2, generation)
 
-                    -- Immediately verify avatar landed on top of nextFloorY; jump if clipped below!
                     ensureAvatarOnFloor(nextFloorY, generation)
                 end
             end
@@ -2218,8 +2311,6 @@ function API.StartSpecialDirtFarm()
     return plan
 end
 
--- Utilities are presentation-only or use the game's ordinary LeaveWorld call.
--- No game scripts, grids, input controls or pickup records are destroyed.
 local Roles = require(RS.Shared.Roles)
 local othersSource = "Players." .. game.Players.LocalPlayer.Name .. ".PlayerGui.GameGui.Others"
 local nativeLeave
@@ -2286,11 +2377,11 @@ function API.CheckUtilities(dryRun)
     local reason, detail = utilityDecision(u, roster, game.Players.LocalPlayer.UserId)
     if dryRun or not reason or u.leaving then return reason, detail end
     u.leaving, u.lastLeave = true, reason .. ": " .. tostring(detail)
-    -- Stop keys/worker BEFORE sending the game's normal leave request, once.
+
     API.Stop(u.lastLeave)
     local ok, failure = pcall(function()
         assert(nativeLeave, "Native leave handler unavailable; reload before enabling auto leave")
-        nativeLeave() -- same LeaveWorld + local reset path as the normal game menu
+        nativeLeave()
     end)
     restoreExecutorContext()
     if not ok then
@@ -2391,15 +2482,12 @@ task.spawn(function()
         end
         if S.utilityLabel then
             local u = API.UtilityStatus()
-            pcall(function() S.utilityLabel:SetText(string.format("World: %s | People: %s\n%s", displayPrivacyText(world.name or "-"),
-                tostring(u.people or "?"), u.lastError or u.lastLeave or "Ready")) end)
+            pcall(function() S.utilityLabel:SetText(UiText.panel(S.utilities.leaving and "Leaving" or ((S.utilities.leaveStaff or S.utilities.leaveCount) and "Monitoring" or "Idle"), u.lastError) .. string.format("\nWorld: %s\nPlayers: %s", displayPrivacyText(world.name or "-"), tostring(u.people or "?"))) end)
         end
         task.wait(0.5)
     end
 end)
 
--- Render-only aliases. Account attributes, renderer.text and world.name remain
--- original; only BitmapText layout output and ordinary display labels are masked.
 local function privacyMask(text,tokens,alias)
     text=tostring(text or "")
     local lower,out,i=text:lower(),{},1
@@ -2510,7 +2598,7 @@ function API.InstallPrivacy()
                 elseif entry.revision~=u.revision or entry.raw~=object.text or (entry.masked and os.clock()-entry.at>0.75) then
                     local raw=object.text
                     local ok,err=pcall(function()
-                        object.text=nil -- invalidate same-text shortcut; layout wrapper preserves raw identity
+                        object.text=nil
                         u.bitmap.set(object,raw)
                     end)
                     if ok then entry.raw=raw;entry.revision=u.revision;entry.at=os.clock() else object.text=raw;u.error=tostring(err) end
@@ -2529,7 +2617,7 @@ function API.InstallPrivacy()
                 end
             end
             if S.label and (u.lastStatus~=S.status or u.lastStatusRevision~=u.revision) then
-                local text=(tostring(S.status or "Idle"):match("^[^\r\n]+") or "Idle"):sub(1,110)
+                local text=API.UIStatusText and API.UIStatusText() or (tostring(S.status or "Idle"):match("^[^\r\n]+") or "Idle"):sub(1,110)
                 pcall(function() S.label:SetText(displayPrivacyText(text)) end)
                 u.lastStatus,u.lastStatusRevision=S.status,u.revision
             end
@@ -2540,9 +2628,9 @@ end
 local privacyOK,privacyError=pcall(API.InstallPrivacy)
 if not privacyOK then S.privacy.error=tostring(privacyError) end
 
--- AUTO FARM V1: deterministic planner and resumable, one-action-at-a-time engine.
+-- AUTO FARM V1
 do
--- FARM_CORE_BEGIN (also exercised verbatim by the offline integration fixture)
+-- FARM_CORE_BEGIN
 local FarmCore = {}
 function FarmCore.layout(fg, db, width, height, selected)
     local p = {rows = {}, slots = {}, excluded = {}, left = 1, right = width - 2, fingerprint = 1}
@@ -2567,7 +2655,7 @@ function FarmCore.layout(fg, db, width, height, selected)
 end
 function FarmCore.key(t) return tostring(t.x) .. ":" .. tostring(t.y) end
 function FarmCore.ready(t, seed, now)
-    -- Native updateTrees uses server time, record.p and ItemDB[record.id].grow.
+
     return t and t.id == seed.id and type(t.p) == "number" and now >= t.p + seed.grow
 end
 function FarmCore.step(f, e)
@@ -2612,8 +2700,7 @@ function FarmCore.step(f, e)
     elseif f.phase == "loot" then
         assert(e.sweep(), "Waiting for batch drops / storage")
         for _, t in f.manifest do assert(e.tile(t) == 0, "A batch block reappeared; preserved for reconciliation") end
-        -- Include native auto-pickups as well as explicit takes. No harvest is
-        -- allowed during this phase, so this finite pool is unused stock+cashback.
+
         f.remaining = e.pool and e.pool(id) or ((f.remaining or 0) + (f.cashback or 0))
         f.manifest, f.cashback = {}, 0
         if f.remaining > 0 then phase("place") else phase("plant") end
@@ -2678,8 +2765,7 @@ end
 local function treeAt(t)
     local raw=treeData and treeData[t.y * world.w + t.x]
     local id=tile(0,t.x,t.y)
-    -- Native registry is {p=serverPlantedTime,f=fruitCount}, not {id=...}.
-    -- The seed identity lives in foreground; join them without altering either.
+
     if raw and DB[id] and DB[id].kind=="seed" then return {id=id,p=raw.p,fruit=raw.f} end
     return nil
 end
@@ -2739,8 +2825,7 @@ end
 local function farmWalk(x, floor)
     checkSession()
     assert(world.fg[floor] and world.fg[floor][x]~=nil,"Invalid farm stance")
-    -- A legal landing can leave the centre in the shaft while one foot touches
-    -- the platform. Align that real contact before the builder's cell checks.
+
     local px,py=position()
     if grounded() and math.abs(py-floor)<0.25 and (px<1.1 or px>world.w-1.1) then
         local began=os.clock()
@@ -2756,7 +2841,7 @@ local function farmWalk(x, floor)
         assert(routeFarm,"Farm navigation not initialized")
         return routeFarm(x,floor)
     end
-    -- The builder's grounded walker already supports one-tile corridors and real input.
+
     dirtWalk(x,floor,f.generation)
     checkSession()
 end
@@ -2775,7 +2860,7 @@ local function farmJump(edge,target)
             if os.clock()-began>0.2 then inputKey(Enum.KeyCode.Space,false) end
             if os.clock()-began>0.25 and grounded() and math.abs(py-target)<0.25 then releaseMovement();return end
             if os.clock()-began>0.3 and grounded() and py<sy-0.35 and tile(0,edge,math.floor(py+0.2))==102 then
-                releaseMovement();return -- short bay jumps may land one platform higher; caller reobserves
+                releaseMovement();return
             end
             task.wait(0.015)
         until os.clock()-began>2.5
@@ -2802,7 +2887,7 @@ local function descend(edge, target)
         repeat
             checkSession()
             local px,ay=position()
-            -- Turn back immediately after feet pass below the previous platform.
+
             if ay>current+0.02 then
                 inputKey(Enum.KeyCode.A,px>edge+0.66);inputKey(Enum.KeyCode.D,px<edge+0.34)
             end
@@ -2817,9 +2902,9 @@ local function descend(edge, target)
         local _,landed=position()
         local actual=math.floor(landed+0.2)
         assert(grounded() and math.abs(landed-actual)<0.25,"Native edge descent did not land")
-        if actual==f.baseFloor+1 then return end -- bay landing is recovered by the outer observed-state router
+        if actual==f.baseFloor+1 then return end
         assert(actual>current and world.fg[actual] and world.fg[actual][edge]==102,"Landing outside platform graph")
-        current=actual -- reconcile a missed platform using the observed landing, not a stale row cursor
+        current=actual
     end
 end
 local function reachFloor(target,edge)
@@ -2867,7 +2952,7 @@ local function moveTo(t,placing)
     local edge=t.direction==1 and 1 or world.w-2
     if current~=t.floor then reachFloor(t.floor,edge) end
     local id=placing and f.config.item or tile(0,t.x,t.y)
-    -- Place solids behind the avatar; mine/harvest from the unfilled side.
+
     local px=position()
     local stance
     if placing then stance=DB[id] and DB[id].solid and t.x+t.direction or t.x-t.direction
@@ -2903,7 +2988,7 @@ local function store(id,amount)
     if not mixed then world.displayPut(x,f.baseFloor,id,n,0.5);restoreExecutorContext() end
     local accepted=not mixed and waitStock(id,have,-n)
     if accepted and boxTotal(id)==beforeBox+n then f.stored=(f.stored or 0)+n;return true end
-    -- A partially accepted deposit is reconciled, never duplicated as a full drop.
+
     counts=inventoryNow();local left=counts[id] or 0
     if left==0 then error("Deposit inventory changed but box not confirmed; inspect storage") end
     local dropCallback
@@ -2911,8 +2996,7 @@ local function store(id,amount)
         if debug.info(fn,"s")==gameSource then dropCallback=fn;break end
     end
     assert(dropCallback,"Box refused and native drop callback unavailable")
-    -- Stand inside the outer shaft ABOVE the box: normal game drop logic decides
-    -- whether to store or create a loose drop. Never bypass its restrictions.
+
     local fallback=math.min(left,math.max(0,n-(have-left)))
     assert(fallback>0,"Partial deposit needs storage reconciliation")
     dropCallback(id,fallback)
@@ -2972,8 +3056,7 @@ local function loot()
                 if got>0 then
                     if d.id==f.config.item and (f.phase=="break" or f.phase=="loot") then f.cashback=(f.cashback or 0)+got end
                     if gem then f.gems=(f.gems or 0)+got end
-                    -- Native world.takeDrop doesn't update client visuals; apply its own
-                    -- acknowledgement handler only after the server returned the count.
+
                     applyTake(d.uid,beforeN,got)
                 end
             end
@@ -3039,8 +3122,7 @@ local function put(p)
     local stock=waitStock(p.id,p.before,-1)
     task.wait(0.25)
     if p.kind=="plant" then
-        -- A server tree record confirms planting even when an automatic seed
-        -- pickup happened in the same interval and cancelled the visible delta.
+
         local tree=treeAt(t)
         return tree and tree.id==p.id and type(tree.p)=="number"
     end
@@ -3053,7 +3135,7 @@ local function remove(t,harvest)
     assert(tile(0,t.x,t.y)==expected,"Unrelated target replaced batch member; preserved")
     if harvest then assert(treeAt(t) and FarmCore.ready(treeAt(t),seedDB,workspace:GetServerTimeNow()),"Tree isn't ripe") end
     moveTo(t,false)
-    -- Only this foreground crop is eligible. No call may fall through to background.
+
     for attempt=1,(DB[expected].hits or 1)*3+6 do
         checkSession()
         if tile(0,t.x,t.y)~=expected then break end
@@ -3072,8 +3154,7 @@ local env={inventory=inventoryNow,scan=scan,stored=boxTotal,fetch=fetch,tile=fun
     pool=function(id) syncDeferred();local n=(inventoryNow()[id] or 0)+boxTotal(id);for _,d in f.deferred do if d.id==id then n+=d.n end end;return n end,
     canFill=function(t)
         if not DB[f.config.item].solid then return true end
-        -- Keep at least one entire crossing corridor free for the return to the
-        -- first placed block. Planting can use every row after the break phase.
+
         for _,row in f.plan.rows do if row.floor~=t.floor and walkClear(1,world.w-2,row.floor) then return true end end
         return false
     end,
@@ -3156,7 +3237,7 @@ function API.StartAutoFarm(options)
             local unfinished=p.pending or next(p.trees or {}) or #(p.manifest or {})>0 or (p.phase~="prepare" and p.phase~="wait")
             if unfinished then
                 assert(p.config.item==f.config.item,"Unfinished checkpoint for another item; select that item and load checkpoint first")
-                API.LoadAutoFarmCheckpoint() -- restore paused work before creating any new manifest
+                API.LoadAutoFarmCheckpoint()
             end
         end
     end
@@ -3212,10 +3293,10 @@ end
 function API.ResumeAutoFarm()
     assert(f.running and f.needsAttention,"No waiting Auto Farm worker")
     assert(world.name==f.boundWorld,"Return to the bound world first")
-    -- A respawn requires an explicit acknowledgement, never an automatic restart.
+
     f.respawnedAt=world.respawnedAt;f.resumeRequested=true
 end
--- Explicit bounded diagnostics; never invoked on load, by config, or by the UI.
+-- Explicit bounded diagnostics;
 function API.ProbeAutoFarm(action,args)
     assert(not S.running and not S.busy,"Pause automation before diagnostics")
     args=args or {};f.plan=scan()
@@ -3300,15 +3381,85 @@ function API.AutoFarmStatus()
 end
 end
 
--- Use Alexandria's own SaveManager, matching the Hush integration.
--- Runtime worker switches and per-world checkpoints are not configuration.
+do
+    local encodedLogo = "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"
+    function API.ResolveBrandLogo()
+        local register = getcustomasset or getsynasset
+        if type(register) ~= "function" or type(writefile) ~= "function" or type(makefolder) ~= "function" then
+            S.logoError = "Custom assets unavailable"
+            return "mountain-snow"
+        end
+        local ok, asset = pcall(function()
+            local path = "BeverlyHub/Growblox/assets"
+            for _, folder in {"BeverlyHub", "BeverlyHub/Growblox", path} do
+                if not isfolder(folder) then makefolder(folder) end
+            end
+            local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            local bytes, accumulator, bits = {}, 0, 0
+            for i = 1, #encodedLogo do
+                local value = alphabet:find(encodedLogo:sub(i, i), 1, true)
+                if value then
+                    accumulator = accumulator * 64 + value - 1
+                    bits += 6
+                    if bits >= 8 then
+                        bits -= 8
+                        bytes[#bytes + 1] = string.char(math.floor(accumulator / 2 ^ bits) % 256)
+                        accumulator %= 2 ^ bits
+                    end
+                end
+            end
+            local file = path .. "/blizzard-hub.png"
+            writefile(file, table.concat(bytes))
+            local uri = register(file)
+            assert(type(uri) == "string" and uri ~= "", "Custom asset registration failed")
+            return uri
+        end)
+        if not ok then S.logoError = UiText.line(asset); return "mountain-snow" end
+        S.logoError, S.logoAsset = nil, asset
+        return asset
+    end
+end
+
+function API.SetAutoFarmEnabled(enabled)
+    S.farmUiEpoch = (S.farmUiEpoch or 0) + 1
+    local epoch = S.farmUiEpoch
+    if not enabled then
+        S.farmUiStarting = false
+        if S.farmUiTask then pcall(task.cancel, S.farmUiTask); S.farmUiTask = nil end
+        API.StopAutoFarm()
+        return
+    end
+    if S.farm.running then return end
+    S.farmUiStarting = true
+    S.farm.error = nil
+    S.farmUiTask = task.spawn(function()
+        local ok, err = xpcall(function()
+            local started, result = pcall(API.StartAutoFarm)
+            if not started and tostring(result):find("Solid/hazard item locked", 1, true) then
+                API.ProbeAutoFarm("safety")
+                if epoch ~= S.farmUiEpoch then return end
+                API.StartAutoFarm()
+            elseif not started then error(result, 0) end
+        end, debug.traceback)
+        if epoch ~= S.farmUiEpoch then return end
+        S.farmUiTask, S.farmUiStarting = nil, false
+        if not ok then
+            S.farm.error = tostring(err)
+            S.farm.message = "Start failed"
+            requestToggle("farm", false)
+        end
+    end)
+end
+
+-- Use Alexandria
+
 local function setupConfigManager(manager, library, settingsTab)
     local folder = "BeverlyHub/Growblox/" .. string.format("%.0f", game.PlaceId)
     manager:SetLibrary(library)
-    manager:IgnoreThemeSettings() -- keep the existing Halloween purple/magenta theme
+    manager:IgnoreThemeSettings()
     manager:SetIgnoreIndexes({"GBAutoClearWorld", "GBSpecialDirtFarm", "GBDirtBuilder", "GBAutoFarm", "GBHideName", "GBHideWorldName"})
     manager:SetFolder(folder)
-    -- Native CRUD remains intact; constrain filenames to this config directory.
+
     local function validName(name)
         if type(name) ~= "string" then return false end
         if #name < 1 or #name > 64 or not name:match("^[%w _%.%-]+$") then return false end
@@ -3331,22 +3482,23 @@ local function setupConfigManager(manager, library, settingsTab)
     return manager
 end
 
--- Same Alexandria initialization, tab/groupbox styling and button compatibility as Hush.
+-- Same Alexandria initialization
 local function buildUI()
     local library = loadstring(game:HttpGet("https://raw.githubusercontent.com/joustingmatch/Alexandria/main/Library.lua"))()
     S.library = library
-    -- Saturated Halloween: chromatic purple surfaces, vivid magenta, no gray-lilac wash.
+    library.ScreenGui:SetAttribute("BlizzardHubOwner", "Growblox")
+
     S.theme = {name = "Witching Hour - Vivid", palette = {
-        BackgroundColor = Color3.fromRGB(39, 15, 68),
-        MainColor = Color3.fromRGB(63, 23, 105),
-        SurfaceColor = Color3.fromRGB(87, 34, 137),
-        AccentColor = Color3.fromRGB(242, 31, 190),
+        BackgroundColor = Color3.fromRGB(39, 25, 57),
+        MainColor = Color3.fromRGB(55, 34, 78),
+        SurfaceColor = Color3.fromRGB(68, 42, 95),
+        AccentColor = Color3.fromRGB(220, 76, 179),
         DarkAccentColor = Color3.fromRGB(123, 50, 174),
-        OutlineColor = Color3.fromRGB(171, 65, 220),
-        InlineColor = Color3.fromRGB(75, 24, 115),
-        HoverColor = Color3.fromRGB(111, 42, 168),
-        FontColor = Color3.fromRGB(249, 240, 255),
-        MutedFontColor = Color3.fromRGB(230, 181, 245),
+        OutlineColor = Color3.fromRGB(95, 60, 121),
+        InlineColor = Color3.fromRGB(47, 30, 67),
+        HoverColor = Color3.fromRGB(85, 52, 113),
+        FontColor = Color3.fromRGB(245, 240, 250),
+        MutedFontColor = Color3.fromRGB(197, 178, 213),
         ToggleOffColor = Color3.fromRGB(86, 29, 126),
         RedColor = Color3.fromRGB(255, 122, 184),
         DestructiveColor = Color3.fromRGB(206, 45, 121),
@@ -3354,7 +3506,7 @@ local function buildUI()
     library.IsLightTheme = false
     for name, color in S.theme.palette do library.Scheme[name] = color end
     library:UpdateColorsUsingRegistry()
-    -- Avoid the executor/cloneref TextService result mismatch observed in CreateWindow.
+
     function library:GetTextBounds(text, font, size, width)
         local scale = self.DPIScale or 1
         local params = Instance.new("GetTextBoundsParams")
@@ -3368,17 +3520,55 @@ local function buildUI()
         end
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
-    local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.12 | Auto Farm",
-        Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
+    local logo = API.ResolveBrandLogo()
+    local discord = "https://discord.gg/C56zw6khS8"
+    local window = library:CreateWindow({Title = "Blizzard Hub Freemium", Icon = logo,
+        Footer = "v0.13  |  discord.gg/C56zw6khS8",
+        Badge = "UNDETECTED", Size = UDim2.fromOffset(720, 480), Center = true, AutoShow = true,
+        CornerRadius = 8, ToggleButtonIcon = logo,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
+    window:HideTabInfo()
+    for _, control in window.MainFrame:QueryDescendants("TextButton") do
+        if control.LayoutOrder == 4 and control.Size == UDim2.fromOffset(30, 30) then
+            local icon = control:FindFirstChildWhichIsA("ImageLabel")
+            local minus = library:GetIcon("minus")
+            if icon and minus then library:ApplyLucideIcon(icon, minus) end
+            S.minimizeButton = control
+        end
+    end
+    for _, label in window.MainFrame:QueryDescendants("TextLabel") do
+        if label.Text == "UNDETECTED" then
+            library:RemoveFromRegistry(label)
+            label.TextColor3 = Color3.fromRGB(78, 222, 137)
+            label.BackgroundColor3 = Color3.fromRGB(21, 51, 37)
+            S.brandBadge = label
+        end
+    end
+    if S.logoAsset then
+        for _, icon in window.MainFrame:QueryDescendants("ImageLabel") do
+            if icon.Image == S.logoAsset then
+                library:RemoveFromRegistry(icon)
+                icon.ImageColor3 = Color3.new(1, 1, 1)
+            end
+        end
+        local toggle = library.ToggleButton
+        if toggle then
+            toggle.Image = S.logoAsset
+            toggle.ImageColor3 = Color3.new(1, 1, 1)
+            toggle.ScaleType = Enum.ScaleType.Fit
+            for _, child in toggle:GetChildren() do
+                if child:IsA("ImageLabel") then child.Visible = false end
+            end
+        end
+    end
+    local home = window:AddTab("Home", "house")
     local clear = window:AddTab("Auto Clear", "ghost")
     local dirtTab = window:AddTab("Dirt Farm", "layers")
     local farmTab = window:AddTab("Auto Farm", "sprout")
-    local utilities = window:AddTab("Utilites", "zap")
+    local utilities = window:AddTab("Utilities", "zap")
     local cfg = window:AddTab("Settings", "settings")
-    S.uiTabs = {"Auto Clear", "Dirt Farm", "Auto Farm", "Utilites", "Settings"}
+    S.uiTabs = {"Home", "Auto Clear", "Dirt Farm", "Auto Farm", "Utilities", "Settings"}
     local function group(tab, side, name, icon)
         return tab:AddGroupbox({Side = side, Name = name, IconName = icon})
     end
@@ -3391,26 +3581,46 @@ local function buildUI()
         end
         return box:AddButton({Text = text, Func = wrapped, Callback = wrapped})
     end
-    local box = group(clear, "Left", "Auto Clear", "ghost")
+    local community = group(home, "Left", "Discord", "message-circle")
+    community:AddLabel("Join our Discord.", true)
+    community:AddLabel(discord, true)
+    community:AddLabel("REPORT BUGS AT DISCORD.", true)
+    S.homeStatus = community:AddLabel("Clipboard: Ready", true)
+    function API.CopyDiscordLink()
+        if type(setclipboard) ~= "function" then
+            S.homeStatus:SetText("Error: Clipboard unavailable")
+            return false
+        end
+        local copied, err = pcall(setclipboard, discord)
+        S.homeStatus:SetText(copied and "Clipboard: Copied" or "Error: " .. UiText.line(err))
+        return copied
+    end
+    S.discordButton = button(community, "Copy Discord Link", API.CopyDiscordLink)
+    local log = group(home, "Right", "Update Log", "history")
+    log:AddLabel("v0.13 - Interface\nHome, English labels and new status panels.\n\nv0.12 - Auto Farm\nBatch farming, storage and harvest modes.", true)
+    local notes = group(home, "Left", "Update Notes", "notebook-text")
+    notes:AddLabel("Automation starts OFF.\nTurn a feature OFF, then ON to retry.\nSolid items are checked before farming.", true)
+    local box = group(clear, "Left", "Auto Clear", "pickaxe")
     S.clearToggle = box:AddToggle("GBAutoClearWorld", {Text = "Auto Clear World", Default = false,
         Callback = function(enabled)
             if S.changingClearToggle then return end
             if not enabled then API.Stop("autoclear toggle OFF"); return end
+            S.clearUIError = nil
             S.cancelAutoStart = false
             task.spawn(function()
                 local ok, err = xpcall(function()
                     if not S.movement.validated or S.movement.world ~= world.name or S.movement.job ~= game.JobId then
                         local test = API.CalibrateGrounded()
                         assert(test.ok, test.error or "Calibration failed")
-                        -- OFF pressed during calibration must cancel pending start.
+
                         if S.cancelAutoStart then return end
                     end
                     API.Start()
                 end, debug.traceback)
-                if not ok then S.lastStopReason = tostring(err):match("^[^\r\n]+") or tostring(err); status("Start failed: " .. S.lastStopReason); syncClearToggle(false) end
+                if not ok then S.clearUIError = tostring(err); S.lastStopReason = tostring(err):match("^[^\r\n]+") or tostring(err); status("Start failed: " .. S.lastStopReason); syncClearToggle(false) end
             end)
         end})
-    S.specialDirtToggle = box:AddToggle("GBSpecialDirtFarm", {Text = "Special Dirt Farm (Tunnel & Platform)", Default = false,
+    S.specialDirtToggle = box:AddToggle("GBSpecialDirtFarm", {Text = "Special Dirt Farm", Default = false,
         Callback = function(enabled)
             if S.changingSpecialDirtToggle then return end
             if not enabled then if S.specialDirt.running then API.Stop("Special Dirt Farm toggle OFF") end; return end
@@ -3418,17 +3628,16 @@ local function buildUI()
                 local ok, err = pcall(API.StartSpecialDirtFarm)
                 if not ok then
                     if S.specialDirt.running then API.Stop("Special dirt start failed") end
+                    S.specialDirt.error = tostring(err)
                     S.specialDirt.phase = tostring(err)
                     requestToggle("specialDirt", false)
                 end
             end)
         end})
-    button(box, "Preview Special Dirt Layout", function() API.SpecialDirtFarmPreview() end)
-    button(box, "Load Special Checkpoint", API.LoadSpecialDirtCheckpoint)
-    local stats = group(clear, "Right", "Tracking", "activity")
-    S.label = stats:AddLabel("Idle", true)
-    S.trackingLabel = stats:AddLabel("FG 0 | BG 0\nCells 0 | Moves 0\nTime 00:00 | Rate 0/min", true)
-    S.lootLabel = stats:AddLabel("Block 0 | Seed 0 | Gems 0", true)
+    local stats = group(clear, "Right", "Status", "activity")
+    S.label = stats:AddLabel(UiText.panel("Idle"), true)
+    S.trackingLabel = stats:AddLabel("Foreground: 0\nBackground: 0\nCells: 0\nMoves: 0", true)
+    S.lootLabel = stats:AddLabel("Blocks: 0 | Seeds: 0\nGems: 0", true)
     local dirtBox = group(dirtTab, "Left", "Dirt Farm", "layers")
     S.dirtToggle = dirtBox:AddToggle("GBDirtBuilder", {Text = "Auto Dirt Farm", Default = false,
         Callback = function(value)
@@ -3438,16 +3647,15 @@ local function buildUI()
                 local ok, err = pcall(API.StartDirtFarm)
                 if not ok then
                     if S.dirt.running then API.Stop("Dirt start failed") end
+                    S.dirt.error = tostring(err)
                     S.dirt.phase = tostring(err)
                     requestToggle("dirt",false)
                 end
             end)
         end})
-    button(dirtBox, "Preview remaining layout", function() API.DirtFarmPreview() end)
-    button(dirtBox, "Load checkpoint", API.LoadDirtCheckpoint)
-    local dirtStats = group(dirtTab, "Right", "Tracking", "activity")
-    S.dirtLabel = dirtStats:AddLabel("Preview before starting", true)
-    local util = group(utilities, "Left", "Utilites", "zap")
+    local dirtStats = group(dirtTab, "Right", "Status", "activity")
+    S.dirtLabel = dirtStats:AddLabel(UiText.panel("Idle"), true)
+    local util = group(utilities, "Left", "Utilities", "zap")
     local farmBox=group(farmTab,"Left","Auto Farm","sprout")
     local labels,itemMap=API.AutoFarmItems()
     local selectedLabel=DB[S.farm.config.item].name.." ["..S.farm.config.item.."]"
@@ -3457,45 +3665,37 @@ local function buildUI()
             local ok,err=pcall(API.ConfigureAutoFarm,itemMap[value],S.farm.config.harvestMode)
             if not ok then S.farm.message=tostring(err) end
         end})
-    S.farmHarvestOption=farmBox:AddDropdown("GBFarmHarvestMode",{Text="Harvest Mode",Values={"Bertahap","Tunggu Semua Matang"},Default="Bertahap",
+    S.farmHarvestOption=farmBox:AddDropdown("GBFarmHarvestMode",{Text="Harvest Mode",Values={"As Ready","Wait Until All Mature"},Default=UiText.harvestLabel(S.farm.config.harvestMode),
         Callback=function(value)
             if S.farm.running then return end
-            local ok,err=pcall(API.ConfigureAutoFarm,S.farm.config.item,value)
+            local ok,err=pcall(function() API.ConfigureAutoFarm(S.farm.config.item,UiText.harvestValue(value)) end)
             if not ok then S.farm.message=tostring(err) end
         end})
+    local setHarvestValue = S.farmHarvestOption.SetValue
+    function S.farmHarvestOption:SetValue(value)
+        if value == "Bertahap" or value == "Tunggu Semua Matang" then value = UiText.harvestLabel(value) end
+        return setHarvestValue(self, value)
+    end
     S.farmToggle=farmBox:AddToggle("GBAutoFarm",{Text="Auto Farm",Default=false,Callback=function(value)
         if S.changingFarmToggle then return end
-        if not value then API.StopAutoFarm();return end
-        task.spawn(function()
-            local ok,err=pcall(API.StartAutoFarm)
-            if not ok then S.farm.message=tostring(err);requestToggle("farm",false) end
-        end)
+        API.SetAutoFarmEnabled(value)
     end})
-    button(farmBox,"Preview",function() API.PreviewAutoFarm() end)
-    button(farmBox,"Load checkpoint",API.LoadAutoFarmCheckpoint)
-    button(farmBox,"Resume waiting",API.ResumeAutoFarm)
-    button(farmBox,"Validate solid / hazard item",function() API.ProbeAutoFarm("safety") end)
-    button(farmBox,"Refresh items",function()
-        assert(not S.farm.running,"Turn Auto Farm OFF first")
-        labels,itemMap=API.AutoFarmItems();S.farmItemOption:SetValues(labels)
-    end)
-    S.farmLabel=group(farmTab,"Right","Tracking","activity"):AddLabel("Preview before starting",true)
+    S.farmLabel=group(farmTab,"Right","Status","activity"):AddLabel(UiText.panel("Idle"),true)
     util:AddToggle("GBHideName", {Text = "Hide Name", Default = true,
         Callback = function(value) API.SetHideName(value) end})
     util:AddToggle("GBHideWorldName", {Text = "Hide World Name", Default = true,
         Callback = function(value) API.SetHideWorldName(value) end})
-    util:AddToggle("GBUltraFPS", {Text = "Ultra FPS booster", Default = false,
+    util:AddToggle("GBUltraFPS", {Text = "Ultra FPS Booster", Default = false,
         Callback = function(value) API.SetUltraFPS(value) end})
-    util:AddToggle("GBLeaveStaff", {Text = "Auto leave on Mods/Admin", Default = false,
+    util:AddToggle("GBLeaveStaff", {Text = "Leave on Moderator / Admin", Default = false,
         Callback = function(value) S.utilities.leaveStaff = value end})
-    util:AddToggle("GBLeaveCount", {Text = "Auto leave at X people", Default = false,
+    util:AddToggle("GBLeaveCount", {Text = "Leave at Player Limit", Default = false,
         Callback = function(value) S.utilities.leaveCount = value end})
-    util:AddSlider("GBMaxPeople", {Text = "People limit (includes you)", Min = 1, Max = 100, Default = 3, Rounding = 0,
+    util:AddSlider("GBMaxPeople", {Text = "Player Limit", Min = 1, Max = 100, Default = 3, Rounding = 0,
         Callback = function(value) S.utilities.maxPeople = math.max(1, math.floor(value)) end})
     local utilStatus = group(utilities, "Right", "Status", "activity")
-    utilStatus:AddLabel("Ultra FPS hides the world. Script and pickups stay active.", true)
     S.utilityLabel = utilStatus:AddLabel("Ready", true)
-    -- Settings intentionally contains only the library's configuration system.
+
     local configOK, configError = pcall(function()
         for name, fn in {isfolder=isfolder, isfile=isfile, listfiles=listfiles, makefolder=makefolder,
             readfile=readfile, writefile=writefile, delfile=delfile} do
@@ -3511,39 +3711,50 @@ local function buildUI()
         S.configSystem = {ready = false, error = tostring(configError)}
         group(cfg, "Right", "Configuration", "folder-cog"):AddLabel("Config unavailable: " .. tostring(configError), true)
     end
+    if not S.running then pcall(API.PreviewAutoFarm) end
     task.spawn(function()
         while S.live do
             flushToggleRequests()
             if S.farmLabel then pcall(function()
-                local a=API.AutoFarmStatus()
-                S.farmItemOption:SetDisabled(a.running);S.farmHarvestOption:SetDisabled(a.running)
-                local desired=DB[S.farm.config.item].name.." ["..S.farm.config.item.."]"
-                if S.farmItemOption.Value~=desired then S.farmItemOption:SetValue(desired) end
-                if S.farmHarvestOption.Value~=S.farm.config.harvestMode then S.farmHarvestOption:SetValue(S.farm.config.harvestMode) end
-                S.farmLabel:SetText(string.format("%s\nFloor %s/%d | Batch %d/%d\nBlock %d | Seed %d\nTrees %d/%d ripe | ETA %ds\nPlaced %d | Broken %d\nHarvest %d | Gems +%d\nLoose %d\n%s",a.message,
-                    tostring(a.row or "-"),a.rows,math.min(a.cursor,a.batch),a.batch,a.block,a.seed,a.ripe,a.trees,math.ceil(a.eta),a.placed,a.broken,a.harvested,a.gems,a.loose,a.storageWarning or a.checkpointError or "Storage: left seed / right block"))
+                local f, a = S.farm, API.AutoFarmStatus()
+                S.farmItemOption:SetDisabled(a.running or S.farmUiStarting)
+                S.farmHarvestOption:SetDisabled(a.running or S.farmUiStarting)
+                local item = DB[f.config.item].name .. " [" .. f.config.item .. "]"
+                local mode = UiText.harvestLabel(f.config.harvestMode)
+                if S.farmItemOption.Value ~= item then S.farmItemOption:SetValue(item) end
+                if S.farmHarvestOption.Value ~= mode then S.farmHarvestOption:SetValue(mode) end
+                local action = S.farmUiStarting and "Starting" or UiText.farmAction(f)
+                S.farmLabel:SetText(UiText.panel(action, a.error or a.checkpointError) .. string.format(
+                    "\nFloor: %s/%d\nBatch: %d/%d\nBlocks: %d | Seeds: %d\nTrees: %d/%d ready\nETA: %ds\nPlaced: %d | Broken: %d\nHarvested: %d\nGems: +%d\nDrops: %d\nStorage: %s",
+                    tostring(a.row or "-"), a.rows, math.min(a.cursor, a.batch), a.batch,
+                    a.block, a.seed, a.ripe, a.trees, math.ceil(a.eta), a.placed, a.broken,
+                    a.harvested, a.gems, a.loose, a.storageWarning and "Loose drops" or "Ready"))
             end) end
             if S.dirtLabel then pcall(function()
                 local d, p = S.dirt, S.dirt.plan
-                S.dirtLabel:SetText(string.format("%s\nRow %s | x %s\nPlaced %d | Floors %d\nRemaining: Dirt %s | Platform %s\nStock: Dirt %s | Platform %s", d.phase,
+                local action = d.running and (tostring(d.phase):find("Waiting", 1, true) and "Waiting for items" or "Building")
+                    or (d.complete and "Complete" or (d.cursor and "Paused" or "Idle"))
+                S.dirtLabel:SetText(UiText.panel(action, d.error) .. string.format(
+                    "\nRow: %s\nPosition: %s\nPlaced: %d\nFloors: %d\nDirt needed: %s\nPlatforms needed: %s\nDirt: %s | Platforms: %s",
                     d.cursor and tostring(d.cursor.row) or "-", d.cursor and tostring(d.cursor.x) or "-", d.placed, d.floors,
-                    p and tostring(p.dirtNeeded) or "?", p and tostring(p.platformsNeeded) or "?",
-                    d.stock and tostring(d.stock[2] or 0) or "?", d.stock and tostring(d.stock[102] or 0) or "?"))
+                    p and tostring(p.dirtNeeded) or "-", p and tostring(p.platformsNeeded) or "-",
+                    d.stock and tostring(d.stock[2] or 0) or "-", d.stock and tostring(d.stock[102] or 0) or "-"))
             end) end
-            if S.specialDirt and S.label then pcall(function()
-                if S.specialDirt.running then
-                    local sd = S.specialDirt
-                    S.label:SetText(string.format("[Special Dirt Farm] %s\nMined %d | Plat %d | Dirt %d | Floors %d",
-                        sd.phase, sd.stats.mined, sd.stats.placedPlatforms, sd.stats.placedDirt, sd.stats.floors))
-                end
-            end) end
-            local p = S.progress
+            local p, sd = S.progress, S.specialDirt
             local elapsed = p and math.max(0, (p.finishedAt or os.clock()) - (p.startedAt or os.clock())) or 0
             local cells = p and p.cells or 0
             pcall(function()
-                S.trackingLabel:SetText(string.format("FG %d | BG %d\nCells %d | Moves %d\nTime %02d:%02d | Rate %.1f/min\nRow %s | Target %s | Detours %d", p and p.foreground or 0,
-                    p and p.background or 0, cells, p and p.moves or 0, math.floor(elapsed / 60), math.floor(elapsed % 60),
-                    elapsed > 0 and cells * 60 / elapsed or 0, p and tostring(p.row) or "-", p and tostring(p.nextX) or "-", p and p.detours or 0))
+                S.label:SetText(displayPrivacyText(API.UIStatusText()))
+                if sd.running then
+                    S.trackingLabel:SetText(string.format("Mined: %d\nPlatforms: %d\nDirt: %d\nFloors: %d",
+                        sd.stats.mined, sd.stats.placedPlatforms, sd.stats.placedDirt, sd.stats.floors))
+                else
+                    S.trackingLabel:SetText(string.format(
+                        "Foreground: %d | Background: %d\nCells: %d | Moves: %d\nTime: %02d:%02d\nRate: %.1f/min\nRow: %s\nTarget: %s\nDetours: %d",
+                        p and p.foreground or 0, p and p.background or 0, cells, p and p.moves or 0,
+                        math.floor(elapsed / 60), math.floor(elapsed % 60), elapsed > 0 and cells * 60 / elapsed or 0,
+                        p and tostring(p.row) or "-", p and tostring(p.nextX) or "-", p and p.detours or 0))
+                end
             end)
             task.wait(0.5)
         end
@@ -3554,7 +3765,7 @@ S.connections[#S.connections + 1] = game:GetService("UserInputService").InputBeg
     if input.KeyCode == Enum.KeyCode.End then API.Stop() end
 end)
 S.connections[#S.connections + 1] = inputService.WindowFocusReleased:Connect(function()
-    -- VirtualInputManager targets Roblox, not OS keyboard input in other apps.
+
     if S.config.pauseOnFocusLoss then API.Stop("window focus lost") else releaseMovement() end
 end)
 local ok, err = xpcall(buildUI, debug.traceback)
