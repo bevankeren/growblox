@@ -3199,7 +3199,7 @@ local function put(p)
         p.sent=true;farmSave()
         f.lastPlaceSent=os.clock()
         nativeSetTile("fg",t.x,t.y,p.id)
-        if p.kind=="place" then beginFarmStride(t) end
+        if p.kind=="place" or p.kind=="plant" then beginFarmStride(t) end
     end
     local deadline=os.clock()+0.9
     local pause=0.04
