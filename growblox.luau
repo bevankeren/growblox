@@ -15,12 +15,14 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.6-utilities", live = true, running = false, busy = false,
+    version = "0.7-autofarm", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil,
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
         verifyEvery = 20, alternative = "punch-burst"},
     utilities = {ultraFPS = false, leaveStaff = false, leaveCount = false, maxPeople = 3, present = {}, hooks = {}, fpsSaved = {}, fpsConnections = {}, leaving = false},
+    farm = {running = false, config = {put = true, breakBlock = true, loot = true, plant = true, interval = 0.35},
+        profile = nil, phase = "Record a manual demo first", cycles = 0, placed = 0, broken = 0, planted = 0, collected = 0},
     mining = {effectiveInterval = 0.24, timeouts = 0, backoffs = 0},
     progress = nil, blocked = {}, engine = "spatial-corridor-v2",
     loot = previousLoot and previousLoot.job == game.JobId and previousLoot or {
@@ -166,6 +168,9 @@ local function syncClearToggle(value)
     S.changingClearToggle = false
 end
 function API.Stop(reason)
+    S.farm.running = false
+    if S.actionRestore then pcall(S.actionRestore); S.actionRestore = nil end
+    if S.farmToggle then S.changingFarmToggle = true; pcall(function() S.farmToggle:SetValue(false) end); S.changingFarmToggle = false end
     S.cancelAutoStart = true
     S.lastStopReason = type(reason) == "string" and reason or "manual pause"
     S.lastStopAt = os.clock()
@@ -1404,6 +1409,181 @@ function API.ExportRecipes()
     return {file = "growblox-recipes.tsv", rows = #Recipes}
 end
 
+-- Scoped ordinary inventory/cursor action for small crafting batches.
+-- No remote bursts, cooldown resets, altered reach or position writes.
+function API.NativeActionAt(itemId, x, y)
+    local ownFarm = S.farm.running and S.worker == coroutine.running()
+    assert(ownFarm or (not S.running and not S.busy), "Pause automation first")
+    assert(type(itemId) == "number" and DB[itemId], "Unknown item")
+    assert(x == math.floor(x) and y == math.floor(y) and x >= 0 and x < world.w and y >= 0 and y < world.h, "Invalid tile")
+    assert(inRange(x, y) and accessible(x, y), "Target not accessible/in range")
+    local counts = refreshLootInventory()
+    assert(itemId == 18 or (counts[itemId] or 0) > 0, "Required item unavailable")
+    local cursor, selected = debug.getupvalue(nativeAct, 3), inventory.selected
+    local aimX = (x + 0.5 - debug.getupvalue(nativeAct, 2)) * debug.getupvalue(nativeAct, 4)
+    local aimY = (y + 0.5 - debug.getupvalue(nativeAct, 5)) * debug.getupvalue(nativeAct, 4)
+    S.actionRestore = function()
+        debug.setupvalue(nativeAct, 3, cursor)
+        inventory.selected = selected
+    end
+    local ok, err = xpcall(function()
+        inventory.selected = itemId
+        debug.setupvalue(nativeAct, 3, Vector2.new(aimX, aimY))
+        nativeAct(1)
+    end, debug.traceback)
+    debug.setupvalue(nativeAct, 3, cursor)
+    inventory.selected = selected
+    S.actionRestore = nil
+    restoreExecutorContext()
+    inventory.changed:Fire()
+    assert(ok, err)
+    return {world = world.name, x = x, y = y, itemId = itemId, foreground = tile(0, x, y)}
+end
+function API.CraftTileStatus(x, y)
+    local counts = refreshLootInventory()
+    return {world = world.name, x = x, y = y, foreground = tile(0, x, y),
+        grassSeed = counts[17] or 0, woodSeed = counts[101] or 0,
+        platformSeed = counts[103] or 0, platform = counts[102] or 0}
+end
+
+-- Auto Farm is an anchored, normal-action cycle, learned from the user's demo.
+-- It never replays movement packets, invents stock, or touches unrelated blocks/trees.
+local function learnFarmProfile(events, db)
+    local placed, broken, plantEvents, takes = {}, {}, {}, 0
+    for _, event in events do
+        local d = event.data
+        if event.kind == "outgoing" and d.packet == "tile" and d.layer == 1 then
+            local k = tostring(d.x) .. ":" .. tostring(d.y)
+            if d.id == 0 then broken[k] = (broken[k] or 0) + 1
+            elseif db[d.id] and db[d.id].kind == "seed" then
+                plantEvents[#plantEvents + 1] = {x = d.x, y = d.y, seed = d.id}
+            elseif db[d.id] and db[d.id].hits then
+                local key = d.id .. ":" .. k
+                local p = placed[key] or {itemId = d.id, x = d.x, y = d.y, count = 0}
+                p.count += 1; placed[key] = p
+            end
+        elseif event.kind == "outgoing" and d.packet == "splice" then
+            plantEvents[#plantEvents + 1] = {x = d.x, y = d.y, seed = d.seed}
+        elseif event.kind == "outgoing" and d.packet == "take" then takes += 1 end
+    end
+    local best
+    for _, p in placed do
+        if (broken[p.x .. ":" .. p.y] or 0) > 0 and (not best or p.count > best.count) then best = p end
+    end
+    if not best then return nil, "Demo needs a placed block that is then broken" end
+    local plants, seen = {}, {}
+    local seedId = db[best.itemId + 1] and db[best.itemId + 1].kind == "seed" and best.itemId + 1 or nil
+    for _, p in plantEvents do
+        local k = p.x .. ":" .. p.y
+        if p.seed == seedId and not seen[k] then
+            plants[#plants + 1] = p; seen[k] = true
+        end
+    end
+    return {itemId = best.itemId, seedId = seedId, x = best.x, y = best.y,
+        placementsObserved = best.count, breaksObserved = broken[best.x .. ":" .. best.y],
+        pickupRequestsObserved = takes, plantTargets = plants}
+end
+function API.UseFarmDemo()
+    assert(not S.running and not S.busy, "Pause first")
+    local r = S.recorder
+    assert(r and not r.active, "Stop recording first")
+    assert(r.world == world.name and r.job == game.JobId, "Demo belongs to another world/server")
+    local profile, err = learnFarmProfile(r.events, DB)
+    assert(profile, err)
+    profile.world, profile.job = world.name, game.JobId
+    S.farm.profile, S.farm.phase = profile, "Demo ready; Auto Farm is OFF"
+    return profile
+end
+function API.AutoFarmStatus()
+    local f = S.farm
+    return {running = f.running, phase = f.phase, profile = f.profile, cycles = f.cycles,
+        placed = f.placed, broken = f.broken, planted = f.planted, collected = f.collected, error = f.error}
+end
+local function farmDecision(config, id, itemId, blocks, seeds, hasPlantTarget)
+    if id ~= 0 and id ~= itemId then return "blocked" end
+    if id == itemId then return config.breakBlock and "break" or "wait" end
+    if config.put and blocks > 0 then return "put" end
+    if config.plant and seeds > 0 and hasPlantTarget then return "plant" end
+    return "wait"
+end
+local function farmPlantTarget(profile)
+    for _, p in profile.plantTargets do
+        local floor = DB[tile(0, p.x, p.y + 1) or 0]
+        if tile(0, p.x, p.y) == 0 and floor and (floor.solid or floor.platform) and not floor.hurts
+            and accessible(p.x, p.y) and inRange(p.x, p.y) then return p end
+    end
+end
+local function farmWaitTile(x, y, expected, generation)
+    local started = os.clock()
+    repeat
+        if not active(generation) then return false, "Cancelled" end
+        if tile(0, x, y) == expected then
+            task.wait(0.4)
+            if tile(0, x, y) == expected then return true end
+            return false, "Server corrected the farm tile"
+        end
+        task.wait(0.08)
+    until os.clock() - started > 2.5
+    return false, "Farm action not confirmed; no request flooding"
+end
+function API.StartAutoFarm()
+    assert(not S.running and not S.busy, "Pause other automation first")
+    assert(not (S.recorder and S.recorder.active), "Stop demo recording first")
+    local f, profile = S.farm, S.farm.profile
+    assert(profile, "Record put + break, then Stop + use demo")
+    assert(profile.world == world.name and profile.job == game.JobId, "Re-record for this world/server")
+    assert(DB[profile.itemId] and DB[profile.itemId].kind ~= "seed", "Invalid farm block")
+    assert(inRange(profile.x, profile.y) and accessible(profile.x, profile.y), "Stand near the learned block target")
+    local px, py = position()
+    assert(not (math.floor(px) == profile.x and math.floor(py - 0.02) + 1 == profile.y), "Cannot farm your supporting floor")
+    S.generation = (S.generation or 0) + 1
+    local generation = S.generation
+    S.boundWorld, S.running, S.busy, f.running, f.error = world.name, true, true, true, nil
+    S.worker = task.spawn(function()
+        task.wait() -- establish S.worker before a scoped inventory action is permitted
+        local ok, err = xpcall(function()
+            while active(generation) and f.running do
+                assert(inRange(profile.x, profile.y), "Farm target out of reach; movement is not replayed")
+                assert(accessible(profile.x, profile.y), "Farm permission changed")
+                if f.config.loot then f.collected += collectNearby(false) end
+                local counts = refreshLootInventory()
+                local plant = farmPlantTarget(profile)
+                local decision = farmDecision(f.config, tile(0, profile.x, profile.y), profile.itemId,
+                    counts[profile.itemId] or 0, counts[profile.seedId] or 0, plant ~= nil)
+                f.phase = decision
+                if decision == "blocked" then error("Different block/tree on target; not touched")
+                elseif decision == "put" then
+                    local x, y = position()
+                    assert(not (math.floor(x) == profile.x and math.floor(y - 0.02) + 1 == profile.y), "Do not farm your support")
+                    API.NativeActionAt(profile.itemId, profile.x, profile.y)
+                    local confirmed, why = farmWaitTile(profile.x, profile.y, profile.itemId, generation)
+                    assert(confirmed, why); f.placed += 1
+                elseif decision == "break" then
+                    assert(grounded(), "Land before farming; no airborne loop")
+                    API.NativeActionAt(18, profile.x, profile.y)
+                    task.wait(math.max(0.35, f.config.interval))
+                    if tile(0, profile.x, profile.y) == 0 then f.broken += 1; f.cycles += 1 end
+                elseif decision == "plant" then
+                    API.NativeActionAt(profile.seedId, plant.x, plant.y)
+                    local confirmed, why = farmWaitTile(plant.x, plant.y, profile.seedId, generation)
+                    assert(confirmed, why); f.planted += 1
+                else f.phase = "Waiting for stock / enabled action" end
+                -- Plant on separate learned tiles between block cycles, if available.
+                if decision == "put" and f.config.plant and plant
+                    and (plant.x ~= profile.x or plant.y ~= profile.y) and (counts[profile.seedId] or 0) > 0 then
+                    API.NativeActionAt(profile.seedId, plant.x, plant.y)
+                    local confirmed, why = farmWaitTile(plant.x, plant.y, profile.seedId, generation)
+                    assert(confirmed, why); f.planted += 1
+                end
+                task.wait(math.max(0.35, f.config.interval))
+            end
+        end, debug.traceback)
+        f.error = not ok and tostring(err) or nil
+        f.phase = ok and "Stopped" or ((tostring(err):match("^[^\r\n]+")) or "Farm error")
+        API.Stop("Auto Farm: " .. f.phase)
+    end)
+end
+
 -- Utilities are presentation-only or use the game's ordinary LeaveWorld call.
 -- No game scripts, grids, input controls or pickup records are destroyed.
 local Roles = require(RS.Shared.Roles)
@@ -1621,14 +1801,15 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.6 | Utilities + paced mining",
+        Footer = "v0.7 | Auto Farm + demo capture",
         Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
     local clear = window:AddTab("Auto Clear", "ghost")
+    local farmTab = window:AddTab("Auto Farm", "sprout")
     local utilities = window:AddTab("Utilites", "zap")
     local cfg = window:AddTab("Settings", "settings")
-    S.uiTabs = {"Auto Clear", "Utilites", "Settings"}
+    S.uiTabs = {"Auto Clear", "Auto Farm", "Utilites", "Settings"}
     local function group(tab, side, name, icon)
         return tab:AddGroupbox({Side = side, Name = name, IconName = icon})
     end
@@ -1664,6 +1845,24 @@ local function buildUI()
     S.label = stats:AddLabel("Idle", true)
     S.trackingLabel = stats:AddLabel("FG 0 | BG 0\nCells 0 | Moves 0\nTime 00:00 | Rate 0/min", true)
     S.lootLabel = stats:AddLabel("Block 0 | Seed 0 | Gems 0", true)
+    local farmBox = group(farmTab, "Left", "Auto Farm", "sprout")
+    S.farmToggle = farmBox:AddToggle("GBAutoFarm", {Text = "Auto Farm", Default = false,
+        Callback = function(value)
+            if S.changingFarmToggle then return end
+            if not value then if S.farm.running then API.Stop("Auto Farm toggle OFF") end; return end
+            task.spawn(function()
+                local ok, err = pcall(API.StartAutoFarm)
+                if not ok then S.farm.phase = tostring(err); S.changingFarmToggle = true; S.farmToggle:SetValue(false); S.changingFarmToggle = false end
+            end)
+        end})
+    farmBox:AddToggle("GBFarmPut", {Text = "Auto put", Default = true, Callback = function(v) S.farm.config.put = v end})
+    farmBox:AddToggle("GBFarmBreak", {Text = "Auto break", Default = true, Callback = function(v) S.farm.config.breakBlock = v end})
+    farmBox:AddToggle("GBFarmLoot", {Text = "Auto loot", Default = true, Callback = function(v) S.farm.config.loot = v end})
+    farmBox:AddToggle("GBFarmPlant", {Text = "Auto plant", Default = true, Callback = function(v) S.farm.config.plant = v end})
+    button(farmBox, "Record my farming", function() API.StartRecording(); S.farm.phase = "Recording manual demo" end)
+    button(farmBox, "Stop + use demo", function() API.StopRecording("farm demo complete"); API.UseFarmDemo() end)
+    local farmStats = group(farmTab, "Right", "Tracking", "activity")
+    S.farmLabel = farmStats:AddLabel("Record a manual demo first", true)
     local util = group(utilities, "Left", "Utilites", "zap")
     util:AddToggle("GBUltraFPS", {Text = "Ultra FPS booster", Default = false,
         Callback = function(value) API.SetUltraFPS(value) end})
@@ -1692,6 +1891,12 @@ local function buildUI()
     button(session, "Unload", API.Unload)
     task.spawn(function()
         while S.live do
+            local f = S.farm
+            if S.farmLabel then pcall(function()
+                local r = API.RecordingStatus()
+                S.farmLabel:SetText(string.format("%s\nPut %d | Broken %d | Planted %d\nLoot %d | Cycles %d\nDemo: %s (%d events)", f.phase,
+                    f.placed, f.broken, f.planted, f.collected, f.cycles, r.active and "REC" or "off", r.events or 0))
+            end) end
             local p = S.progress
             local elapsed = p and math.max(0, (p.finishedAt or os.clock()) - (p.startedAt or os.clock())) or 0
             local cells = p and p.cells or 0
