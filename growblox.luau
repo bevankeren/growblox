@@ -16,7 +16,7 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.9.2-clear-row-lock", live = true, running = false, busy = false,
+    version = "0.9.3-edge-contact", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil, uiRequests = {},
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
@@ -439,16 +439,37 @@ local function supported(x, y)
     local d = DB[tile(0, x, y + 1) or 0]
     return d ~= nil and not d.hurts and (d.solid == true or d.platform == true)
 end
-local function grounded()
-    local px, py = position()
-    local sy = math.floor(py - 0.02)
-    if math.abs(py - (sy + 1)) >= 0.18 or not canStand(math.floor(px), sy) then return false end
-    -- Normal collisions can leave the center over a ledge while one foot is supported.
-    for _, foot in {px - 0.2, px, px + 0.2} do
-        local d = DB[tile(0, math.floor(foot), sy + 1) or 0]
-        if d and not d.hurts and (d.solid == true or d.platform == true) then return true end
+-- Ground contact is not route/headroom clearance. Use the nearest floor
+-- plane, not floor(py-0.02): small positive collision offsets crossed a whole
+-- cell boundary and falsely labelled a resting avatar as airborne.
+local function contactFloor(py)
+    local fy=math.floor(py+0.5)
+    if fy<1 or fy>=world.h or math.abs(py-fy)>0.12 then return nil end
+    return fy
+end
+local function supportContact(px,py)
+    local fy=contactFloor(py)
+    if not fy then return nil end
+    for _,foot in {px,px-0.30,px+0.30} do
+        local x=math.floor(foot)
+        if x>=0 and x<world.w and passable(tile(0,x,fy-1)) then
+            local d=DB[tile(0,x,fy) or 0]
+            if d and not d.hurts and (d.solid==true or d.platform==true) then return fy,x end
+        end
     end
+    return nil
+end
+local function avatarSupportAt(x,y)
+    local px,py=position()
+    if contactFloor(py)~=y or x<0 or x>=world.w then return false end
+    local d=DB[tile(0,x,y) or 0]
+    if not d or d.hurts or not (d.solid==true or d.platform==true) or not passable(tile(0,x,y-1)) then return false end
+    for _,foot in {px,px-0.30,px+0.30} do if math.floor(foot)==x then return true end end
     return false
+end
+local function grounded()
+    local px,py=position()
+    return supportContact(px,py)~=nil
 end
 local function waitGrounded(timeout, generation)
     local began = os.clock()
@@ -482,10 +503,12 @@ local function jumpArcClear(sx, sy, nx, ny)
 end
 local function pathTo(x, y, exact)
     local px, py = position()
-    local sx, sy = math.floor(px), math.floor(py - 0.02)
+    local floorY=supportContact(px,py)
+    if not floorY then return nil, "Avatar has no physical foot contact; waiting for normal landing" end
+    local sx, sy = math.floor(px), floorY-1
     if not supported(sx, sy) then
         local anchored
-        for _, foot in {px - 0.2, px + 0.2} do
+        for _, foot in {px - 0.30, px + 0.30} do
             if supported(math.floor(foot), sy) then sx, anchored = math.floor(foot), true; break end
         end
         if not anchored then return nil, "Avatar is not grounded; no flying route will be generated" end
@@ -638,7 +661,7 @@ local function safeCornerDescent(x, y)
     local p = S.progress
     if not p or (x ~= p.bounds.x0 and x ~= p.bounds.x1 and x ~= p.entryX) then return false end
     local px, py = position()
-    if math.floor(px) ~= x or math.floor(py - 0.02) + 1 ~= y then return false end
+    if not avatarSupportAt(x,y) then return false end
     local below = DB[tile(0, x, y + 1) or 0]
     return eligible(0, x, y) and passable(tile(0, x, y - 1)) and below ~= nil
         and not below.hurts and (below.solid == true or below.platform == true)
@@ -669,7 +692,7 @@ local function navigate(x, y, generation, stay)
     releaseMovement()
     if not waitGrounded(2, generation) then return false, "Waiting for normal landing" end
     local px, py = position()
-    local ownSupport = tile(0, x, y) ~= 0 and math.floor(px) == x and math.floor(py - 0.02) + 1 == y
+    local ownSupport = tile(0, x, y) ~= 0 and avatarSupportAt(x,y)
     if ownSupport and safeCornerDescent(x, y) then
         S.progress.phase = "corner-descent"
         return true
@@ -854,7 +877,7 @@ local function mineLayer(x, y, layer, generation, run)
         if not accessible(x, y) then return false, "Build permission changed" end
         local ax, ay = position()
         if not grounded() then return false, "Mining stopped because avatar left the ground" end
-        if layer == 0 and math.floor(ax) == x and math.floor(ay - 0.02) + 1 == y and not safeCornerDescent(x, y) then
+        if layer == 0 and avatarSupportAt(x,y) and not safeCornerDescent(x, y) then
             return false, "Refusing to remove the support under the avatar; replan from the side"
         end
         if not canMineFrom(ax, ay, x, y) then return false, "Target moved out of normal reach" end
@@ -916,7 +939,7 @@ local function openSpawnUnderpass(tx,ty,generation,run)
         for x=u.x0,u.x1 do
             local id=tile(0,x,tunnelY)
             local below=DB[tile(0,x,tunnelY+1) or 0]
-            local ownSupport=math.floor(ax)==x and math.floor(ay-0.02)+1==tunnelY
+            local ownSupport=avatarSupportAt(x,tunnelY)
             if eligible(0,x,tunnelY) and DB[id] and not DB[id].hurts and not ownSupport
                 and below and not below.hurts and (below.solid or below.platform)
                 and canMineFrom(ax,ay,x,tunnelY) then
@@ -2400,7 +2423,7 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.9.2 | Row-locked clear",
+        Footer = "v0.9.3 | Edge-contact fix",
         Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
