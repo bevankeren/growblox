@@ -2492,7 +2492,49 @@ function API.SetUltraFPS(enabled)
         if u.oldFPSCap ~= nil then pcall(setfpscap, u.oldFPSCap); u.oldFPSCap = nil end
     end
 end
+function API.SetUnlockCamera(enabled)
+    local u=S.utilities
+    if not enabled then
+        local z=u.cameraZoom
+        if not z then return end
+        z.active=false
+        for _,connection in pairs(z.connections) do pcall(function() connection:Disconnect() end) end
+        pcall(function() debug.setupvalue(z.callback,1,z.original) end)
+        u.cameraZoom=nil
+        return
+    end
+    if u.cameraZoom and u.cameraZoom.active then return end
+    local callback
+    for _,fn in pairs(filtergc("function",{Constants={"MouseWheel"}},false)) do
+        if debug.info(fn,"s")==gameSource and type(debug.getupvalue(fn,1))=="number" then callback=fn;break end
+    end
+    assert(callback,"Native 2D camera zoom control unavailable")
+    local value=debug.getupvalue(callback,1)
+    local z={active=true,callback=callback,original=value,target=value,connections={}}
+    u.cameraZoom=z
+    local function apply(value)
+        z.target=math.clamp(value,0.05,8)
+        task.defer(function()
+            if z.active and u.cameraZoom==z then
+                local ok,err=pcall(debug.setupvalue,z.callback,1,z.target)
+                if not ok then u.lastError="Camera: "..tostring(err) end
+            end
+        end)
+    end
+    z.connections[#z.connections+1]=inputService.InputChanged:Connect(function(input)
+        if not z.active or input.UserInputType~=Enum.UserInputType.MouseWheel or input.Position.Z==0 then return end
+        if inputService:GetFocusedTextBox() then return end
+        apply(z.target * 1.12 ^ input.Position.Z)
+    end)
+    z.connections[#z.connections+1]=inputService.TouchPinch:Connect(function(_,scale,_,state)
+        if not z.active or type(scale)~="number" or scale<=0 then return end
+        if state==Enum.UserInputState.Begin then z.pinchStart=z.target end
+        if z.pinchStart then apply(z.pinchStart*scale) end
+        if state==Enum.UserInputState.End or state==Enum.UserInputState.Cancel then z.pinchStart=nil end
+    end)
+end
 function API.CleanupUtilities()
+    if API.SetUnlockCamera then API.SetUnlockCamera(false) end
     if API.CleanupPrivacy then API.CleanupPrivacy() end
     API.SetUltraFPS(false)
     for _, hook in S.utilities.hooks do
@@ -3810,6 +3852,11 @@ local function buildUI()
         Callback = function(value) API.SetHideName(value) end})
     util:AddToggle("GBHideWorldName", {Text = "Hide World Name", Default = true,
         Callback = function(value) API.SetHideWorldName(value) end})
+    util:AddToggle("GBUnlockCamera", {Text = "Unlock Camera", Default = false,
+        Callback = function(value)
+            local ok,err=pcall(API.SetUnlockCamera,value)
+            if not ok then S.utilities.lastError=tostring(err) end
+        end})
     util:AddToggle("GBUltraFPS", {Text = "Ultra FPS Booster", Default = false,
         Callback = function(value) API.SetUltraFPS(value) end})
     util:AddToggle("GBLeaveStaff", {Text = "Leave on Moderator / Admin", Default = false,
