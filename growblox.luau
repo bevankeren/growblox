@@ -3048,16 +3048,26 @@ local function loot()
             and (d.x-px)^2+(d.y-py)^2<=2.2^2 then
             counts=inventoryNow()
             local gem=DB[d.id] and DB[d.id].kind=="gem"
-            local want=gem and 65535 or math.max(0,200-(counts[d.id] or 0))
-            if want>0 then
-                local beforeN=d.n or 1
-                local got=world.takeDrop(d.uid,math.min(want,d.n or 1));restoreExecutorContext()
-                assert(type(got)=="number","Unexpected loot response")
-                if got>0 then
-                    if d.id==f.config.item and (f.phase=="break" or f.phase=="loot") then f.cashback=(f.cashback or 0)+got end
-                    if gem then f.gems=(f.gems or 0)+got end
-
-                    applyTake(d.uid,beforeN,got)
+            if gem then
+                -- Anti-magnet fix: gems require native physical avatar touch, not remote takeDrop packet.
+                local targetX = math.clamp(math.floor(d.x + 0.5), 1, world.w - 2)
+                local curX = position()
+                if math.abs(curX - (targetX + 0.5)) > 0.3 then
+                    farmWalk(targetX, math.floor(py + 0.2))
+                end
+                task.wait(0.04)
+                f.gems = (f.gems or 0) + (d.n or 1)
+                applyTake(d.uid, d.n or 1, d.n or 1)
+            else
+                local want=math.max(0,200-(counts[d.id] or 0))
+                if want>0 then
+                    local beforeN=d.n or 1
+                    local got=world.takeDrop(d.uid,math.min(want,d.n or 1));restoreExecutorContext()
+                    assert(type(got)=="number","Unexpected loot response")
+                    if got>0 then
+                        if d.id==f.config.item and (f.phase=="break" or f.phase=="loot") then f.cashback=(f.cashback or 0)+got end
+                        applyTake(d.uid,beforeN,got)
+                    end
                 end
             end
         end
@@ -3083,8 +3093,13 @@ local function sweep()
         for _,r in f.plan.rows do if math.abs(d.y-r.floor)<1.6 then row=r;break end end
         assert(row,"A drop is outside the safe route; waiting for inspection")
         reachFloor(row.floor,d.x<world.w/2 and 1 or world.w-2)
-        local sx=math.clamp(math.floor(d.x),1,world.w-2)
-        if passable(tile(0,sx,row.y)) then farmWalk(sx,row.floor) else error("Drop route occupied; retained in tracking") end
+        local sx=math.clamp(math.floor(d.x + 0.5),1,world.w-2)
+        if passable(tile(0,sx,row.y)) then
+            farmWalk(sx,row.floor)
+            task.wait(0.05)
+        else
+            error("Drop route occupied; retained in tracking")
+        end
         loot()
     end
     syncDeferred()
@@ -3144,8 +3159,15 @@ local function remove(t,harvest)
         task.wait(f.interval)
         if attempt>math.max(2,DB[expected].hits or 1) then f.interval=math.min(0.6,f.interval+0.05) end
     end
-    task.wait(0.35)
-    return tile(0,t.x,t.y)==0 and (not harvest or not treeAt(t))
+    task.wait(0.2)
+    local broken = tile(0,t.x,t.y)==0 and (not harvest or not treeAt(t))
+    if broken then
+        -- Physically walk directly into the broken tile to collide with and collect dropped gems!
+        -- No remote magnet packets for gems (patched by anticheat).
+        farmWalk(t.x, t.floor)
+        task.wait(0.04)
+    end
+    return broken
 end
 local env={inventory=inventoryNow,scan=scan,stored=boxTotal,fetch=fetch,tile=function(t)return tile(0,t.x,t.y)end,
     place=put,remove=remove,tree=treeAt,loot=loot,sweep=sweep,save=farmSave,
