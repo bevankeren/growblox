@@ -2709,8 +2709,9 @@ function FarmCore.step(f, e)
         local k = FarmCore.key(t)
         if not f.pending and e.tile(t) ~= 0 then f.cursor = f.cursor + (1); return end
         if not f.pending then
-            if (e.inventory()[id] or 0) == 0 then assert(e.fetch(id), "Waiting for scheduled block stock"); return end
-            f.pending = {kind = "place", target = t, id = id, before = e.inventory()[id] or 0}
+            local available = e.inventory()[id] or 0
+            if available == 0 then assert(e.fetch(id), "Waiting for scheduled block stock"); return end
+            f.pending = {kind = "place", target = t, id = id, before = available}
             e.save()
         end
         assert(e.place(f.pending), "Waiting for placement acknowledgement; no blind resend")
@@ -2980,7 +2981,13 @@ local function moveTo(t,placing)
     if current~=t.floor then reachFloor(t.floor,edge) end
     local id=placing and f.config.item or tile(0,t.x,t.y)
 
-    local px=position()
+    local px, ay=position()
+    if placing and DB[id] and not DB[id].solid and not DB[id].hurts and grounded()
+        and math.abs(ay-t.floor)<0.25 and math.abs(px-t.x-0.5)>=0.95 then
+        local reach=type(controls.buildRange)=="function" and math.min(2.2,controls.buildRange()) or 2.2
+        if (px-t.x-0.5)^2+(ay-t.y-0.5)^2<=reach^2 and accessible(t.x,t.y)
+            and inRange(t.x,t.y) and canMineFrom(px,ay,t.x,t.y) then return end
+    end
     local stance
     if placing then stance=DB[id] and DB[id].solid and t.x+t.direction or t.x-t.direction
     else stance=px>t.x+0.5 and t.x+1 or t.x-1 end
@@ -3155,20 +3162,30 @@ local function put(p)
     if not p.sent then
         assert(tile(0,t.x,t.y)==0,"Target occupied; no overwrite/splice")
         moveTo(t,true)
+        local delay=math.max(0,0.15-(os.clock()-(f.lastPlaceSent or -math.huge)))
+        if delay>0 then task.wait(delay);checkSession() end
+        assert(grounded() and accessible(t.x,t.y) and inRange(t.x,t.y),"Unsafe placement stance")
         assert(tile(0,t.x,t.y)==0 and not treeAt(t),"Target changed during movement")
         p.before=inventoryNow()[p.id] or 0
         assert(p.before>0,"No stock for placement")
         p.sent=true;farmSave()
+        f.lastPlaceSent=os.clock()
         nativeSetTile("fg",t.x,t.y,p.id)
     end
-    local stock=waitStock(p.id,p.before,-1)
-    task.wait(0.25)
-    if p.kind=="plant" then
-
-        local tree=treeAt(t)
-        return tree and tree.id==p.id and type(tree.p)=="number"
-    end
-    return stock and tile(0,t.x,t.y)==p.id
+    local deadline=os.clock()+0.9
+    local pause=0.04
+    repeat
+        checkSession()
+        local stock=inventoryNow()[p.id] or 0
+        if p.kind=="plant" then
+            local tree=treeAt(t)
+            if tree and tree.id==p.id and type(tree.p)=="number" then return true end
+        elseif stock==p.before-1 and tile(0,t.x,t.y)==p.id then return true end
+        if os.clock()>=deadline then break end
+        task.wait(math.min(pause,deadline-os.clock()))
+        pause=math.min(0.16,pause*2)
+    until false
+    return false
 end
 local function remove(t,harvest)
     checkSession()
