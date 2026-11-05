@@ -1,4 +1,4 @@
--- Growblox workbench v0.5 | SPATIAL CORRIDOR | native input only
+-- Growblox v0.9 | DEMO-BASED DIRT BUILDER | native A/D/Space only
 -- UI adapted from ../hush/UI_GUIDE.md and scripts/hush.luau.
 -- Starts idle. Never changes ItemDB or clears on load. Probe instrumentation is scoped/restored.
 local E = getgenv()
@@ -6,6 +6,7 @@ local previousResults = E.GrowbloxHub and E.GrowbloxHub.State.results or {}
 local previousProgress = E.GrowbloxHub and E.GrowbloxHub.State.progress
 local previousMovement = E.GrowbloxHub and E.GrowbloxHub.State.movement
 local previousLoot = E.GrowbloxHub and E.GrowbloxHub.State.loot
+local previousRecorder = E.GrowbloxHub and E.GrowbloxHub.State.recorder
 if previousProgress and previousProgress.movementMode ~= "native-input" then previousProgress = nil end
 if E.GrowbloxHub and E.GrowbloxHub.Unload then E.GrowbloxHub.Unload() end
 local RS = game:GetService("ReplicatedStorage")
@@ -15,14 +16,15 @@ local DB = require(RS.Shared.ItemDB)
 local Recipes = require(RS.Shared.Splice.Recipes)
 local Splice = require(RS.Shared.Splice)
 local S = {
-    version = "0.7-autofarm", live = true, running = false, busy = false,
+    version = "0.9-dirt-builder", live = true, running = false, busy = false,
     status = "Idle - preview before starting", results = previousResults, events = {},
     sent = 0, nativeCalls = 0, confirmed = 0, localCleared = 0, connections = {}, plan = nil,
     config = {interval = 0.24, limit = 0, radius = 2, background = true, autoPickup = true, onFull = "continue", pickupRadius = 2.2, pauseOnFocusLoss = false,
         verifyEvery = 20, alternative = "punch-burst"},
     utilities = {ultraFPS = false, leaveStaff = false, leaveCount = false, maxPeople = 3, present = {}, hooks = {}, fpsSaved = {}, fpsConnections = {}, leaving = false},
-    farm = {running = false, config = {put = true, breakBlock = true, loot = true, plant = true, interval = 0.35},
-        profile = nil, phase = "Record a manual demo first", cycles = 0, placed = 0, broken = 0, planted = 0, collected = 0},
+    farm = {running = false, config = {loot = false}}, -- cancelled; no Auto Farm worker/UI
+    dirt = {running = false, phase = "Preview before starting", placed = 0, floors = 0,
+        checkpointFile = "growblox-dirt-builder-checkpoint.json", config = {topY = 3, interval = 0.25, rowLimit = 0}},
     mining = {effectiveInterval = 0.24, timeouts = 0, backoffs = 0},
     progress = nil, blocked = {}, engine = "spatial-corridor-v2",
     loot = previousLoot and previousLoot.job == game.JobId and previousLoot or {
@@ -106,6 +108,13 @@ end
 assert(world and controls and world.goTo, "Runtime layout changed; refusing to send")
 if previousProgress and previousProgress.engine == S.engine and previousProgress.world == world.name
     and previousProgress.job == game.JobId then S.progress = previousProgress end
+if previousRecorder and not previousRecorder.active and previousRecorder.world == world.name and previousRecorder.job == game.JobId then
+    S.recorder = previousRecorder
+end
+local nativeSetTile
+for _, f in debug.getupvalues(nativeAct) do
+    if type(f)=="function" and debug.info(f,"n")=="setTile" then nativeSetTile=f;break end
+end
 local function position()
     -- Verified goTo upvalues 1/2 are the current tile-space player x/y.
     local x, y = debug.getupvalue(world.goTo, 1), debug.getupvalue(world.goTo, 2)
@@ -148,19 +157,33 @@ end
 Net.tileChanged.listen(changed)
 local inputService = game:GetService("UserInputService")
 local virtualInput = game:GetService("VirtualInputManager")
+-- Dedicated executor input pump never calls a game RPC. Native Net.call can
+-- resume its caller with game-script capabilities even if its numeric identity
+-- is restored to 8; movement requests therefore cross a plain-data queue.
+local sentKeys, lastSentAt = {}, {}
 local function inputKey(key, down)
-    if S.movement.keys[key] == down then return end
-    restoreExecutorContext()
-    virtualInput:SendKeyEvent(down, key, false, game)
-    S.movement.keys[key] = down
+    assert(not S.inputError, S.inputError)
+    S.movement.keys[key] = down == true
 end
 local function releaseMovement()
-    restoreExecutorContext()
-    for _, k in {Enum.KeyCode.A, Enum.KeyCode.D, Enum.KeyCode.Space} do
-        pcall(function() virtualInput:SendKeyEvent(false, k, false, game) end)
-        S.movement.keys[k] = false
-    end
+    for _, key in {Enum.KeyCode.A, Enum.KeyCode.D, Enum.KeyCode.Space} do S.movement.keys[key] = false end
 end
+task.spawn(function()
+    restoreExecutorContext()
+    while S.live do
+        for _, key in {Enum.KeyCode.A, Enum.KeyCode.D, Enum.KeyCode.Space} do
+            local desired = S.movement.keys[key] == true
+            if sentKeys[key] ~= desired or (desired and os.clock() - (lastSentAt[key] or 0) > 0.12) then
+                local ok, err = pcall(function() virtualInput:SendKeyEvent(desired, key, false, game) end)
+                if ok then sentKeys[key], lastSentAt[key] = desired, os.clock() else S.inputError = "Native input pump: " .. tostring(err) end
+            end
+        end
+        task.wait(0.015)
+    end
+    for _, key in {Enum.KeyCode.A, Enum.KeyCode.D, Enum.KeyCode.Space} do
+        pcall(function() virtualInput:SendKeyEvent(false, key, false, game) end)
+    end
+end)
 local function syncClearToggle(value)
     if not S.clearToggle then return end
     S.changingClearToggle = true
@@ -169,6 +192,12 @@ local function syncClearToggle(value)
 end
 function API.Stop(reason)
     S.farm.running = false
+    if S.dirt.running and not (type(reason)=="string" and reason:sub(1,10)=="Dirt Farm:") then
+        S.dirt.phase="Paused: "..(type(reason)=="string" and reason or "manual stop")
+    end
+    S.dirt.running = false
+    if API.SaveDirtCheckpoint then API.SaveDirtCheckpoint() end
+    if S.dirtToggle then S.changingDirtToggle = true; pcall(function() S.dirtToggle:SetValue(false) end); S.changingDirtToggle = false end
     if S.actionRestore then pcall(S.actionRestore); S.actionRestore = nil end
     if S.farmToggle then S.changingFarmToggle = true; pcall(function() S.farmToggle:SetValue(false) end); S.changingFarmToggle = false end
     S.cancelAutoStart = true
@@ -242,11 +271,15 @@ end
 local function passable(id)
     if id == nil then return false end
     local d = DB[id or 0]
-    return id == 0 or (d ~= nil and not d.solid and not d.hurts and d.kind ~= "seed")
+    return id == 0 or (d ~= nil and not d.solid and not d.hurts and (d.kind ~= "seed" or (S.farm and S.farm.running)))
 end
 local function canStand(x, y)
-    return x >= 0 and x < world.w and y >= 1 and y < world.h
-        and passable(tile(0, x, y)) and passable(tile(0, x, y - 1))
+    if not (x >= 0 and x < world.w and y >= 1 and y < world.h and passable(tile(0, x, y))) then return false end
+    -- Native farming demo and the Main Door spawn both stand in a one-cell
+    -- clear corridor below a solid ceiling. Do not impose a two-cell body on
+    -- this mode; the real game still performs all collisions via normal input.
+    if (S.farm and S.farm.running) or (S.dirt and S.dirt.running) then return true end
+    return passable(tile(0, x, y - 1))
 end
 local function canMineFrom(px, py, x, y)
     local dx, dy = x + 0.5 - px, y + 0.5 - py
@@ -462,6 +495,7 @@ function API.PlanRoute(x, y, exact)
 end
 local collectNearby
 local function follow(path, generation)
+    local metrics = S.dirt.running and S.dirt or (S.farm.running and S.farm or S.progress)
     for _, n in path do
         if not active(generation) then releaseMovement(); return false, "Paused" end
         if not supported(n.x, n.y) then releaseMovement(); return false, "Landing support changed; replan" end
@@ -505,10 +539,13 @@ local function follow(path, generation)
         end
         local alignedX, alignedY = position()
         if not grounded() or math.abs(alignedX - gx) > 0.35 or math.abs(alignedY - gy) > 0.25 then return false, "Landing drift; replan" end
-        S.progress.moves += 1
+        metrics.moves += 1
         local px, py = position()
-        S.progress.distance += math.sqrt((px - fromX)^2 + (py - fromY)^2)
-        if collectNearby and S.config.autoPickup then collectNearby(false) end
+        metrics.distance += math.sqrt((px - fromX)^2 + (py - fromY)^2)
+        if collectNearby and S.config.autoPickup and (not S.farm.running or S.farm.config.loot) then
+            local got = collectNearby(false)
+            if S.farm.running then S.farm.collected += got end
+        end
     end
     releaseMovement()
     if not waitGrounded(1.5, generation) then return false, "Did not land normally" end
@@ -1409,180 +1446,226 @@ function API.ExportRecipes()
     return {file = "growblox-recipes.tsv", rows = #Recipes}
 end
 
--- Scoped ordinary inventory/cursor action for small crafting batches.
--- No remote bursts, cooldown resets, altered reach or position writes.
-function API.NativeActionAt(itemId, x, y)
-    local ownFarm = S.farm.running and S.worker == coroutine.running()
-    assert(ownFarm or (not S.running and not S.busy), "Pause automation first")
-    assert(type(itemId) == "number" and DB[itemId], "Unknown item")
-    assert(x == math.floor(x) and y == math.floor(y) and x >= 0 and x < world.w and y >= 0 and y < world.h, "Invalid tile")
-    assert(inRange(x, y) and accessible(x, y), "Target not accessible/in range")
-    local counts = refreshLootInventory()
-    assert(itemId == 18 or (counts[itemId] or 0) > 0, "Required item unavailable")
-    local cursor, selected = debug.getupvalue(nativeAct, 3), inventory.selected
-    local aimX = (x + 0.5 - debug.getupvalue(nativeAct, 2)) * debug.getupvalue(nativeAct, 4)
-    local aimY = (y + 0.5 - debug.getupvalue(nativeAct, 5)) * debug.getupvalue(nativeAct, 4)
-    S.actionRestore = function()
-        debug.setupvalue(nativeAct, 3, cursor)
-        inventory.selected = selected
+-- Pattern captured in BEVERLY: platforms x=1/98, Dirt x=2..97, rows 35/33.
+-- Build UP from the highest complete floor; this mode never mines terrain/items.
+local function planDirtLayout(fg, db, width, height, topY)
+    local left, right = 1, width - 2
+    assert(width >= 6 and height >= 8, "World too small")
+    topY = math.max(3, math.floor(topY or 3))
+    local function cell(x,y) return fg[y] and fg[y][x] end
+    local function safeFloor(id)
+        local d = db[id or 0]
+        return d and not d.hurts and (d.solid == true or d.platform == true)
     end
-    local ok, err = xpcall(function()
-        inventory.selected = itemId
-        debug.setupvalue(nativeAct, 3, Vector2.new(aimX, aimY))
-        nativeAct(1)
-    end, debug.traceback)
-    debug.setupvalue(nativeAct, 3, cursor)
-    inventory.selected = selected
-    S.actionRestore = nil
-    restoreExecutorContext()
-    inventory.changed:Fire()
-    assert(ok, err)
-    return {world = world.name, x = x, y = y, itemId = itemId, foreground = tile(0, x, y)}
+    local base
+    for y = topY, height - 2 do
+        if cell(left,y) == 102 and cell(right,y) == 102 then
+            local full = true
+            for x = left + 1, right - 1 do if not safeFloor(cell(x,y)) then full = false; break end end
+            if full then base = y; break end
+        end
+    end
+    assert(base, "No complete demo floor found; build one floor with platform at each end")
+    local rows, dirt, platforms, exceptions, blockers = {}, 0, 0, {}, {}
+    for y = base - 2, topY, -2 do
+        rows[#rows + 1] = y
+        for x = left, right do
+            local desired = (x == left or x == right) and 102 or 2
+            local id = cell(x,y)
+            if id == 0 then
+                if desired == 2 then dirt += 1 else platforms += 1 end
+            elseif id ~= desired then
+                local v = {x=x,y=y,id=id}
+                if desired == 2 and safeFloor(id) then exceptions[#exceptions + 1] = v else blockers[#blockers + 1] = v end
+            end
+        end
+    end
+    return {baseFloor = base, firstRow = rows[1], topY = topY, left = left, right = right,
+        rows = rows, dirtPerFloor = right-left-1, platformsPerFloor = 2, step = 2,
+        dirtNeeded = dirt, platformsNeeded = platforms, protectedExceptions = exceptions, blockers = blockers}
 end
-function API.CraftTileStatus(x, y)
-    local counts = refreshLootInventory()
-    return {world = world.name, x = x, y = y, foreground = tile(0, x, y),
-        grassSeed = counts[17] or 0, woodSeed = counts[101] or 0,
-        platformSeed = counts[103] or 0, platform = counts[102] or 0}
+function API.DirtFarmPreview()
+    assert(not S.running and not S.busy, "Pause automation before preview")
+    local p = planDirtLayout(world.fg, DB, world.w, world.h, S.dirt.config.topY)
+    S.dirt.plan, S.dirt.stock = p, refreshLootInventory()
+    S.dirt.phase = string.format("%d floors | %d Dirt + %d platform needed", #p.rows, p.dirtNeeded, p.platformsNeeded)
+    return p
+end
+function API.SaveDirtCheckpoint()
+    local d = S.dirt
+    if not d.cursor or type(writefile) ~= "function" then return end
+    local record = {version=1,world=world.name,job=game.JobId,cursor=d.cursor,placed=d.placed,floors=d.floors,phase=d.phase}
+    local ok, err = pcall(writefile, d.checkpointFile, game:GetService("HttpService"):JSONEncode(record))
+    d.checkpointError = not ok and tostring(err) or nil
+end
+function API.LoadDirtCheckpoint()
+    assert(not S.running and not S.busy, "Pause first")
+    local d = S.dirt
+    assert(type(readfile)=="function" and type(isfile)=="function" and isfile(d.checkpointFile), "No Dirt Farm checkpoint")
+    local p = game:GetService("HttpService"):JSONDecode(readfile(d.checkpointFile))
+    assert(p.version==1 and p.world==world.name and p.job==game.JobId, "Checkpoint is from another world/server")
+    assert(type(p.cursor)=="table" and type(p.cursor.row)=="number" and type(p.cursor.x)=="number", "Invalid checkpoint")
+    d.cursor,d.placed,d.floors,d.phase = p.cursor,p.placed or 0,p.floors or 0,"Checkpoint loaded; toggle ON to resume"
+    return d.cursor
+end
+local function dirtWalk(x, floorY, generation)
+    local d, target = S.dirt, x + 0.5
+    for attempt=1,3 do
+        if not active(generation) then return false end
+        local px,py = position()
+        assert(math.abs(py-floorY)<0.25 and grounded(), "Return to the build floor/platform before resuming")
+        if math.abs(px-target)<=0.4 then return true end
+        -- Validate every supporting cell. No jumping gaps or position forcing.
+        for sx=math.min(math.floor(px),x),math.max(math.floor(px),x) do
+            local floor=DB[tile(0,sx,floorY) or 0]
+            assert(floor and not floor.hurts and (floor.solid or floor.platform), "Gap/hazard in the lower support floor")
+            assert(passable(tile(0,sx,floorY-1)), "Walking corridor contains a block/tree; preserved")
+        end
+        local began,lastX,lastProgress = os.clock(),px,os.clock()
+        repeat
+            if not active(generation) then releaseMovement(); return false end
+            local ax,ay=position()
+            assert(math.abs(ay-floorY)<0.4, "Left the support floor; no forced recovery")
+            local dx=target-ax
+            if math.abs(dx)<=0.4 then
+                releaseMovement();task.wait(0.07)
+                ax=position()
+                if math.abs(ax-target)<=0.45 then return true end
+            else
+                inputKey(Enum.KeyCode.A,dx<0);inputKey(Enum.KeyCode.D,dx>0)
+            end
+            if math.abs(ax-lastX)>0.04 then lastX,lastProgress=ax,os.clock() end
+            if os.clock()-lastProgress>1 then break end
+            task.wait(0.015)
+        until os.clock()-began>2+math.abs(target-px)/3
+        releaseMovement();task.wait(0.15)
+    end
+    error("Build walk stalled; checkpoint retained")
+end
+local function dirtClimb(edge,targetFloor,generation)
+    assert(tile(0,edge,targetFloor)==102, "Missing access platform at next floor")
+    for _=1,3 do
+        if not active(generation) then return false end
+        local _,py=position()
+        if grounded() and math.abs(py-targetFloor)<0.22 then return true end
+        assert(math.abs(py-targetFloor-2)<0.25 and grounded(), "Stand below the access platform")
+        dirtWalk(edge,targetFloor+2,generation)
+        releaseMovement();inputKey(Enum.KeyCode.Space,true)
+        local began=os.clock()
+        repeat
+            if not active(generation) then releaseMovement();return false end
+            if os.clock()-began>=0.2 then inputKey(Enum.KeyCode.Space,false) end
+            local px,ay=position()
+            inputKey(Enum.KeyCode.A,px>edge+0.75)
+            inputKey(Enum.KeyCode.D,px<edge+0.25)
+            if os.clock()-began>0.3 and grounded() and math.abs(ay-targetFloor)<0.22 then releaseMovement();return true end
+            task.wait(0.02)
+        until os.clock()-began>2.5
+        releaseMovement();task.wait(0.3)
+    end
+    error("Native jump did not reach platform; checkpoint retained")
+end
+local function dirtReachFloor(targetFloor,edge,generation)
+    for _=1,math.ceil(world.h/2) do
+        local _,py=position()
+        if grounded() and math.abs(py-targetFloor)<0.22 then return true end
+        local current=math.floor(py+0.2)
+        assert(current>targetFloor and (current-targetFloor)%2==0, "Stand on an existing Dirt Farm floor below the new row")
+        dirtWalk(edge,current,generation)
+        if not dirtClimb(edge,current-2,generation) then return false end
+    end
+    error("Could not reach builder level")
+end
+local function dirtAwaitMaterial(id,generation)
+    local d=S.dirt
+    while active(generation) do
+        d.stock=refreshLootInventory()
+        if (d.stock[id] or 0)>0 then return d.stock[id] end
+        releaseMovement()
+        d.phase="Waiting for "..(DB[id] and DB[id].name or tostring(id)).."; toggle stays ON"
+        API.SaveDirtCheckpoint()
+        task.wait(1)
+    end
+    return nil
+end
+function API.StartDirtFarm()
+    assert(not S.running and not S.busy,"Pause other automation first")
+    assert(not (S.recorder and S.recorder.active),"Stop recording first")
+    assert(nativeSetTile,"Native placement helper unavailable")
+    local d=S.dirt
+    local plan=API.DirtFarmPreview()
+    assert(#plan.blockers==0,"An access/air target is occupied; preserved. Inspect preview blockers")
+    if #plan.rows==0 then d.phase="Upper layout already complete";return plan end
+    local cursor=d.cursor
+    if not cursor or cursor.world~=world.name or cursor.job~=game.JobId or cursor.row<plan.topY or cursor.row>plan.firstRow then
+        local px=position()
+        local direction=math.abs(px-plan.left-0.5)<=math.abs(px-plan.right-0.5) and 1 or -1
+        cursor={world=world.name,job=game.JobId,row=plan.firstRow,x=direction==1 and plan.left or plan.right,direction=direction}
+        d.cursor=cursor
+    end
+    S.boundWorld=world.name;S.generation=(S.generation or 0)+1
+    local generation=S.generation
+    d.running,S.running,S.busy,d.error=true,true,true,nil
+    S.changingDirtToggle=true;if S.dirtToggle then S.dirtToggle:SetValue(true) end;S.changingDirtToggle=false
+    S.worker=task.spawn(function()
+        task.wait()
+        local ok,err=xpcall(function()
+            local initialFloors=d.floors
+            while active(generation) and cursor.row>=plan.topY do
+                local startEdge=cursor.direction==1 and plan.left or plan.right
+                if not dirtReachFloor(cursor.row+2,startEdge,generation) then return end
+                while active(generation) and cursor.x>=plan.left and cursor.x<=plan.right do
+                    local x,y=cursor.x,cursor.row
+                    local wanted=(x==plan.left or x==plan.right) and 102 or 2
+                    local id=tile(0,x,y)
+                    if id==0 then
+                        if not dirtAwaitMaterial(wanted,generation) then return end
+                        dirtWalk(x,y+2,generation)
+                        assert(accessible(x,y) and inRange(x,y),"Build target unavailable/out of range")
+                        assert(tile(0,x,y)==0,"Target changed while waiting; preserved")
+                        local before=S.dirt.stock[wanted]
+                        nativeSetTile("fg",x,y,wanted)
+                        task.wait(math.max(0.25,d.config.interval))
+                        -- Native local placement is optimistic: check settlement AND server stock.
+                        d.stock=refreshLootInventory()
+                        assert(tile(0,x,y)==wanted,"Placement corrected/rejected; not retried blindly")
+                        if (d.stock[wanted] or 0)>=before then
+                            task.wait(0.4);d.stock=refreshLootInventory()
+                            assert((d.stock[wanted] or 0)<before,"Placement has no stock acknowledgement; verify before retry")
+                        end
+                        d.placed+=1
+                        if wanted==2 then plan.dirtNeeded=math.max(0,plan.dirtNeeded-1) else plan.platformsNeeded=math.max(0,plan.platformsNeeded-1) end
+                    elseif id~=wanted then
+                        local def=DB[id]
+                        assert(wanted==2 and def and not def.hurts and (def.solid or def.platform),"Occupied cell cannot be replaced; preserved")
+                    end
+                    cursor.x+=cursor.direction
+                    d.phase="Building row "..y..(cursor.direction==1 and " >" or " <")
+                    API.SaveDirtCheckpoint()
+                end
+                if not active(generation) then return end
+                d.floors+=1
+                if d.config.rowLimit>0 and d.floors-initialFloors>=d.config.rowLimit then d.phase="Row limit reached; resume continues above";cursor.row-=2;cursor.direction=-cursor.direction;cursor.x=cursor.direction==1 and plan.left or plan.right;return end
+                local edge=cursor.direction==1 and plan.right or plan.left
+                if cursor.row-2>=plan.topY then
+                    dirtWalk(edge,cursor.row+2,generation)
+                    if not dirtClimb(edge,cursor.row,generation) then return end
+                end
+                cursor.row-=2;cursor.direction=-cursor.direction
+                cursor.x=cursor.direction==1 and plan.left or plan.right
+            end
+            d.phase="Upper Dirt Farm layout finished; protected cells kept"
+            d.complete=true
+        end,debug.traceback)
+        releaseMovement()
+        d.error=not ok and tostring(err) or nil
+        if not ok then d.phase=(tostring(err):match("^[^\r\n]+")) or tostring(err) end
+        API.SaveDirtCheckpoint()
+        API.Stop("Dirt Farm: "..d.phase)
+    end)
+    return plan
 end
 
--- Auto Farm is an anchored, normal-action cycle, learned from the user's demo.
--- It never replays movement packets, invents stock, or touches unrelated blocks/trees.
-local function learnFarmProfile(events, db)
-    local placed, broken, plantEvents, takes = {}, {}, {}, 0
-    for _, event in events do
-        local d = event.data
-        if event.kind == "outgoing" and d.packet == "tile" and d.layer == 1 then
-            local k = tostring(d.x) .. ":" .. tostring(d.y)
-            if d.id == 0 then broken[k] = (broken[k] or 0) + 1
-            elseif db[d.id] and db[d.id].kind == "seed" then
-                plantEvents[#plantEvents + 1] = {x = d.x, y = d.y, seed = d.id}
-            elseif db[d.id] and db[d.id].hits then
-                local key = d.id .. ":" .. k
-                local p = placed[key] or {itemId = d.id, x = d.x, y = d.y, count = 0}
-                p.count += 1; placed[key] = p
-            end
-        elseif event.kind == "outgoing" and d.packet == "splice" then
-            plantEvents[#plantEvents + 1] = {x = d.x, y = d.y, seed = d.seed}
-        elseif event.kind == "outgoing" and d.packet == "take" then takes += 1 end
-    end
-    local best
-    for _, p in placed do
-        if (broken[p.x .. ":" .. p.y] or 0) > 0 and (not best or p.count > best.count) then best = p end
-    end
-    if not best then return nil, "Demo needs a placed block that is then broken" end
-    local plants, seen = {}, {}
-    local seedId = db[best.itemId + 1] and db[best.itemId + 1].kind == "seed" and best.itemId + 1 or nil
-    for _, p in plantEvents do
-        local k = p.x .. ":" .. p.y
-        if p.seed == seedId and not seen[k] then
-            plants[#plants + 1] = p; seen[k] = true
-        end
-    end
-    return {itemId = best.itemId, seedId = seedId, x = best.x, y = best.y,
-        placementsObserved = best.count, breaksObserved = broken[best.x .. ":" .. best.y],
-        pickupRequestsObserved = takes, plantTargets = plants}
-end
-function API.UseFarmDemo()
-    assert(not S.running and not S.busy, "Pause first")
-    local r = S.recorder
-    assert(r and not r.active, "Stop recording first")
-    assert(r.world == world.name and r.job == game.JobId, "Demo belongs to another world/server")
-    local profile, err = learnFarmProfile(r.events, DB)
-    assert(profile, err)
-    profile.world, profile.job = world.name, game.JobId
-    S.farm.profile, S.farm.phase = profile, "Demo ready; Auto Farm is OFF"
-    return profile
-end
-function API.AutoFarmStatus()
-    local f = S.farm
-    return {running = f.running, phase = f.phase, profile = f.profile, cycles = f.cycles,
-        placed = f.placed, broken = f.broken, planted = f.planted, collected = f.collected, error = f.error}
-end
-local function farmDecision(config, id, itemId, blocks, seeds, hasPlantTarget)
-    if id ~= 0 and id ~= itemId then return "blocked" end
-    if id == itemId then return config.breakBlock and "break" or "wait" end
-    if config.put and blocks > 0 then return "put" end
-    if config.plant and seeds > 0 and hasPlantTarget then return "plant" end
-    return "wait"
-end
-local function farmPlantTarget(profile)
-    for _, p in profile.plantTargets do
-        local floor = DB[tile(0, p.x, p.y + 1) or 0]
-        if tile(0, p.x, p.y) == 0 and floor and (floor.solid or floor.platform) and not floor.hurts
-            and accessible(p.x, p.y) and inRange(p.x, p.y) then return p end
-    end
-end
-local function farmWaitTile(x, y, expected, generation)
-    local started = os.clock()
-    repeat
-        if not active(generation) then return false, "Cancelled" end
-        if tile(0, x, y) == expected then
-            task.wait(0.4)
-            if tile(0, x, y) == expected then return true end
-            return false, "Server corrected the farm tile"
-        end
-        task.wait(0.08)
-    until os.clock() - started > 2.5
-    return false, "Farm action not confirmed; no request flooding"
-end
-function API.StartAutoFarm()
-    assert(not S.running and not S.busy, "Pause other automation first")
-    assert(not (S.recorder and S.recorder.active), "Stop demo recording first")
-    local f, profile = S.farm, S.farm.profile
-    assert(profile, "Record put + break, then Stop + use demo")
-    assert(profile.world == world.name and profile.job == game.JobId, "Re-record for this world/server")
-    assert(DB[profile.itemId] and DB[profile.itemId].kind ~= "seed", "Invalid farm block")
-    assert(inRange(profile.x, profile.y) and accessible(profile.x, profile.y), "Stand near the learned block target")
-    local px, py = position()
-    assert(not (math.floor(px) == profile.x and math.floor(py - 0.02) + 1 == profile.y), "Cannot farm your supporting floor")
-    S.generation = (S.generation or 0) + 1
-    local generation = S.generation
-    S.boundWorld, S.running, S.busy, f.running, f.error = world.name, true, true, true, nil
-    S.worker = task.spawn(function()
-        task.wait() -- establish S.worker before a scoped inventory action is permitted
-        local ok, err = xpcall(function()
-            while active(generation) and f.running do
-                assert(inRange(profile.x, profile.y), "Farm target out of reach; movement is not replayed")
-                assert(accessible(profile.x, profile.y), "Farm permission changed")
-                if f.config.loot then f.collected += collectNearby(false) end
-                local counts = refreshLootInventory()
-                local plant = farmPlantTarget(profile)
-                local decision = farmDecision(f.config, tile(0, profile.x, profile.y), profile.itemId,
-                    counts[profile.itemId] or 0, counts[profile.seedId] or 0, plant ~= nil)
-                f.phase = decision
-                if decision == "blocked" then error("Different block/tree on target; not touched")
-                elseif decision == "put" then
-                    local x, y = position()
-                    assert(not (math.floor(x) == profile.x and math.floor(y - 0.02) + 1 == profile.y), "Do not farm your support")
-                    API.NativeActionAt(profile.itemId, profile.x, profile.y)
-                    local confirmed, why = farmWaitTile(profile.x, profile.y, profile.itemId, generation)
-                    assert(confirmed, why); f.placed += 1
-                elseif decision == "break" then
-                    assert(grounded(), "Land before farming; no airborne loop")
-                    API.NativeActionAt(18, profile.x, profile.y)
-                    task.wait(math.max(0.35, f.config.interval))
-                    if tile(0, profile.x, profile.y) == 0 then f.broken += 1; f.cycles += 1 end
-                elseif decision == "plant" then
-                    API.NativeActionAt(profile.seedId, plant.x, plant.y)
-                    local confirmed, why = farmWaitTile(plant.x, plant.y, profile.seedId, generation)
-                    assert(confirmed, why); f.planted += 1
-                else f.phase = "Waiting for stock / enabled action" end
-                -- Plant on separate learned tiles between block cycles, if available.
-                if decision == "put" and f.config.plant and plant
-                    and (plant.x ~= profile.x or plant.y ~= profile.y) and (counts[profile.seedId] or 0) > 0 then
-                    API.NativeActionAt(profile.seedId, plant.x, plant.y)
-                    local confirmed, why = farmWaitTile(plant.x, plant.y, profile.seedId, generation)
-                    assert(confirmed, why); f.planted += 1
-                end
-                task.wait(math.max(0.35, f.config.interval))
-            end
-        end, debug.traceback)
-        f.error = not ok and tostring(err) or nil
-        f.phase = ok and "Stopped" or ((tostring(err):match("^[^\r\n]+")) or "Farm error")
-        API.Stop("Auto Farm: " .. f.phase)
-    end)
-end
 
 -- Utilities are presentation-only or use the game's ordinary LeaveWorld call.
 -- No game scripts, grids, input controls or pickup records are destroyed.
@@ -1801,15 +1884,15 @@ local function buildUI()
         return math.ceil(bounds.X / scale), math.ceil(bounds.Y / scale)
     end
     local window = library:CreateWindow({Title = "Growblox | Witching Hour", Icon = "ghost",
-        Footer = "v0.7 | Auto Farm + demo capture",
+        Footer = "v0.9 | Dirt builder",
         Badge = "HALLOWEEN", Size = UDim2.fromOffset(660, 420), Center = true, AutoShow = true,
         Resizable = true, NotifySide = "Right", ToggleKeybind = Enum.KeyCode.RightShift})
     S.window = window
     local clear = window:AddTab("Auto Clear", "ghost")
-    local farmTab = window:AddTab("Auto Farm", "sprout")
+    local dirtTab = window:AddTab("Dirt Farm", "layers")
     local utilities = window:AddTab("Utilites", "zap")
     local cfg = window:AddTab("Settings", "settings")
-    S.uiTabs = {"Auto Clear", "Auto Farm", "Utilites", "Settings"}
+    S.uiTabs = {"Auto Clear", "Dirt Farm", "Utilites", "Settings"}
     local function group(tab, side, name, icon)
         return tab:AddGroupbox({Side = side, Name = name, IconName = icon})
     end
@@ -1845,24 +1928,23 @@ local function buildUI()
     S.label = stats:AddLabel("Idle", true)
     S.trackingLabel = stats:AddLabel("FG 0 | BG 0\nCells 0 | Moves 0\nTime 00:00 | Rate 0/min", true)
     S.lootLabel = stats:AddLabel("Block 0 | Seed 0 | Gems 0", true)
-    local farmBox = group(farmTab, "Left", "Auto Farm", "sprout")
-    S.farmToggle = farmBox:AddToggle("GBAutoFarm", {Text = "Auto Farm", Default = false,
+    local dirtBox = group(dirtTab, "Left", "Dirt Farm", "layers")
+    S.dirtToggle = dirtBox:AddToggle("GBDirtBuilder", {Text = "Auto Dirt Farm", Default = false,
         Callback = function(value)
-            if S.changingFarmToggle then return end
-            if not value then if S.farm.running then API.Stop("Auto Farm toggle OFF") end; return end
+            if S.changingDirtToggle then return end
+            if not value then if S.dirt.running then API.Stop("Dirt builder toggle OFF") end; return end
             task.spawn(function()
-                local ok, err = pcall(API.StartAutoFarm)
-                if not ok then S.farm.phase = tostring(err); S.changingFarmToggle = true; S.farmToggle:SetValue(false); S.changingFarmToggle = false end
+                local ok, err = pcall(API.StartDirtFarm)
+                if not ok then
+                    S.dirt.phase = tostring(err)
+                    S.changingDirtToggle = true; S.dirtToggle:SetValue(false); S.changingDirtToggle = false
+                end
             end)
         end})
-    farmBox:AddToggle("GBFarmPut", {Text = "Auto put", Default = true, Callback = function(v) S.farm.config.put = v end})
-    farmBox:AddToggle("GBFarmBreak", {Text = "Auto break", Default = true, Callback = function(v) S.farm.config.breakBlock = v end})
-    farmBox:AddToggle("GBFarmLoot", {Text = "Auto loot", Default = true, Callback = function(v) S.farm.config.loot = v end})
-    farmBox:AddToggle("GBFarmPlant", {Text = "Auto plant", Default = true, Callback = function(v) S.farm.config.plant = v end})
-    button(farmBox, "Record my farming", function() API.StartRecording(); S.farm.phase = "Recording manual demo" end)
-    button(farmBox, "Stop + use demo", function() API.StopRecording("farm demo complete"); API.UseFarmDemo() end)
-    local farmStats = group(farmTab, "Right", "Tracking", "activity")
-    S.farmLabel = farmStats:AddLabel("Record a manual demo first", true)
+    button(dirtBox, "Preview remaining layout", function() API.DirtFarmPreview() end)
+    button(dirtBox, "Load checkpoint", API.LoadDirtCheckpoint)
+    local dirtStats = group(dirtTab, "Right", "Tracking", "activity")
+    S.dirtLabel = dirtStats:AddLabel("Preview before starting", true)
     local util = group(utilities, "Left", "Utilites", "zap")
     util:AddToggle("GBUltraFPS", {Text = "Ultra FPS booster", Default = false,
         Callback = function(value) API.SetUltraFPS(value) end})
@@ -1886,16 +1968,22 @@ local function buildUI()
         Callback = function(v) S.config.limit = v end})
     button(settings, "Calibrate movement", API.CalibrateGrounded)
     button(settings, "Load checkpoint", API.LoadCheckpoint)
+    local dirtSettings = group(cfg, "Right", "Dirt builder", "layers")
+    dirtSettings:AddSlider("GBDirtRowLimit", {Text = "Floor limit (0 = all)", Min = 0, Max = 25, Default = 0, Rounding = 0,
+        Callback = function(v) S.dirt.config.rowLimit = math.floor(v) end})
+    dirtSettings:AddSlider("GBDirtInterval", {Text = "Place interval", Min = 0.25, Max = 1, Default = 0.25, Rounding = 2,
+        Callback = function(v) S.dirt.config.interval = v end})
     local session = group(cfg, "Right", "Session", "moon")
     session:AddLabel("RightShift: menu | End: stop")
     button(session, "Unload", API.Unload)
     task.spawn(function()
         while S.live do
-            local f = S.farm
-            if S.farmLabel then pcall(function()
-                local r = API.RecordingStatus()
-                S.farmLabel:SetText(string.format("%s\nPut %d | Broken %d | Planted %d\nLoot %d | Cycles %d\nDemo: %s (%d events)", f.phase,
-                    f.placed, f.broken, f.planted, f.collected, f.cycles, r.active and "REC" or "off", r.events or 0))
+            if S.dirtLabel then pcall(function()
+                local d, p = S.dirt, S.dirt.plan
+                S.dirtLabel:SetText(string.format("%s\nRow %s | x %s\nPlaced %d | Floors %d\nRemaining: Dirt %s | Platform %s\nStock: Dirt %s | Platform %s", d.phase,
+                    d.cursor and tostring(d.cursor.row) or "-", d.cursor and tostring(d.cursor.x) or "-", d.placed, d.floors,
+                    p and tostring(p.dirtNeeded) or "?", p and tostring(p.platformsNeeded) or "?",
+                    d.stock and tostring(d.stock[2] or 0) or "?", d.stock and tostring(d.stock[102] or 0) or "?"))
             end) end
             local p = S.progress
             local elapsed = p and math.max(0, (p.finishedAt or os.clock()) - (p.startedAt or os.clock())) or 0
